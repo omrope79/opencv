@@ -260,7 +260,7 @@ TEST(readNet, do_not_call_setInput)  // https://github.com/opencv/opencv/issues/
     // 1. load network
     const string proto = findDataFile("dnn/squeezenet_v1.1.prototxt");
     const string model = findDataFile("dnn/squeezenet_v1.1.caffemodel", false);
-    Net net = readNetFromCaffe(proto, model);
+    Net net = readNet(proto, model);
 
     // 2. mistake: no inputs are specified through .setInput()
 
@@ -581,20 +581,23 @@ INSTANTIATE_TEST_CASE_P(/**/, DeprecatedForward, dnnBackendsAndTargets());
 
 TEST(Net, forwardAndRetrieve)
 {
-    std::string prototxt =
-        "input: \"data\"\n"
-        "layer {\n"
-        "  name: \"testLayer\"\n"
-        "  type: \"Slice\"\n"
-        "  bottom: \"data\"\n"
-        "  top: \"firstCopy\"\n"
-        "  top: \"secondCopy\"\n"
-        "  slice_param {\n"
-        "    axis: 0\n"
-        "    slice_point: 2\n"
-        "  }\n"
-        "}";
-    Net net = readNetFromCaffe(&prototxt[0], prototxt.size());
+    // Build a net with a Slice layer programmatically (no Caffe parser needed in OpenCV 5.x).
+    LayerParams lpSlice;
+    lpSlice.name = "testLayer";
+    lpSlice.type = "Slice";
+    // Slice along axis=0 at index 2  (splits [0,4) -> [0,2) and [2,4))
+    lpSlice.set("axis", 0);
+    Mat slicePoint = (Mat_<int>(1, 1) << 2);
+    lpSlice.set("slice_point", DictValue::arrayInt<int*>((int*)slicePoint.data, 1));
+
+    LayerParams lpInput;
+    lpInput.name = "data";
+    lpInput.type = "Identity";
+
+    Net net;
+    int inputId = net.addLayer(lpInput.name, lpInput.type, lpInput);
+    int sliceId = net.addLayer(lpSlice.name, lpSlice.type, lpSlice);
+    net.connect(inputId, 0, sliceId, 0);
     net.setPreferableBackend(DNN_BACKEND_OPENCV);
 
     Mat inp(4, 5, CV_32F);
