@@ -192,8 +192,32 @@ public:
         }
     }
 
-    PriorBoxLayerImpl(const LayerParams &params)
+    // Remap plural ONNX-export attribute names to the singular names this layer expects.
+    static LayerParams normalizeONNXParams(const LayerParams& params)
     {
+        LayerParams p = params;
+        auto remap = [&](const std::string& from, const std::string& to) {
+            if (p.has(from) && !p.has(to))
+                p.set(to, p.get(from));
+        };
+        remap("variances",     "variance");
+        remap("min_sizes",     "min_size");
+        remap("max_sizes",     "max_size");
+        remap("aspect_ratios", "aspect_ratio");
+        // ONNX exports 'steps' as float[2]; unpack into step_h/step_w that the layer reads separately.
+        if (p.has("steps") && !p.has("step_h") && !p.has("step_w")) {
+            DictValue steps = p.get("steps");
+            if (steps.size() == 2) {
+                p.set("step_h", steps.get<float>(0));
+                p.set("step_w", steps.get<float>(1));
+            }
+        }
+        return p;
+    }
+
+    PriorBoxLayerImpl(const LayerParams &params_)
+    {
+        const LayerParams params = normalizeONNXParams(params_);
         setParamsFrom(params);
         _flip = getParameter<bool>(params, "flip", 0, false, true);
         _clip = getParameter<bool>(params, "clip", 0, false, true);
