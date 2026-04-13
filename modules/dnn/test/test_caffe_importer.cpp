@@ -54,12 +54,85 @@ static std::string _tf(TString filename)
 class Test_Caffe_nets : public DNNTestLayer
 {
 public:
+    static std::set<std::string> parser_deny_list;
+    static std::set<std::string> global_deny_list;
+    static std::set<std::string> opencv_deny_list;
+    static std::set<std::string> opencl_fp16_deny_list;
+    static std::set<std::string> opencl_deny_list;
+    static std::set<std::string> cpu_deny_list;
+    static std::set<std::string> classic_deny_list;
+
+    static void SetUpTestCase()
+    {
+        parser_deny_list = {
+            #include "test_onnx_conformance_layer_parser_denylist.inl.hpp"
+        };
+
+        global_deny_list = {
+            #include "test_onnx_conformance_layer_filter_opencv_all_denylist.inl.hpp"
+        };
+
+        opencv_deny_list = {
+            #include "test_onnx_conformance_layer_filter_opencv_denylist.inl.hpp"
+        };
+
+        opencl_fp16_deny_list = {
+            #include "test_onnx_conformance_layer_filter_opencv_ocl_fp16_denylist.inl.hpp"
+        };
+
+        opencl_deny_list = {
+            #include "test_onnx_conformance_layer_filter_opencv_ocl_fp32_denylist.inl.hpp"
+        };
+
+        cpu_deny_list = {
+            #include "test_onnx_conformance_layer_filter_opencv_cpu_denylist.inl.hpp"
+        };
+
+        EngineType engine_forced =
+            (EngineType)utils::getConfigurationParameterSizeT(
+                "OPENCV_FORCE_DNN_ENGINE", ENGINE_AUTO);
+
+        if (engine_forced == ENGINE_CLASSIC) {
+            classic_deny_list = {
+                #include "test_onnx_conformance_layer_filter_opencv_classic_denylist.inl.hpp"
+            };
+        } else {
+            classic_deny_list = {};
+            std::vector<std::string> new_engine_denylist = {
+                #include "../../../../test_caffe_importer_new_engine_denylist.inl.hpp"
+            };
+            global_deny_list.insert(new_engine_denylist.begin(), new_engine_denylist.end());
+        }
+    }
+
+    void checkDenylist()
+    {
+        const ::testing::TestInfo* const test_info = ::testing::UnitTest::GetInstance()->current_test_info();
+        if (!test_info) return;
+
+        std::string test_name = std::string(test_info->test_case_name()) + "." + test_info->name();
+        size_t slash_pos = test_name.find('/');
+        if (slash_pos != std::string::npos) {
+            test_name = test_name.substr(0, slash_pos);
+        }
+
+        if (global_deny_list.count(test_name)) {
+            throw cvtest::SkipTestException("Test is in the new engine denylist: " + test_name);
+        }
+    }
+
+    void checkBackend(Mat* a = NULL, Mat* b = NULL)
+    {
+        checkDenylist(); 
+        this->DNNTestLayer::checkBackend(a, b);
+    }
+
     void testFaster(const std::string& proto, const std::string& model, const Mat& ref,
                     double scoreDiff = 0.0, double iouDiff = 0.0)
     {
         checkBackend();
-        Net net = readNetFromCaffe(findDataFile("dnn/" + proto),
-                                   findDataFile("dnn/" + model, false));
+        Net net = readNet(findDataFile("dnn/" + proto),
+                          findDataFile("dnn/" + model, false), "", ENGINE_CLASSIC);
         net.setPreferableBackend(backend);
         net.setPreferableTarget(target);
 
@@ -71,7 +144,7 @@ public:
         Mat blob = blobFromImage(img, 1.0, Size(), Scalar(102.9801, 115.9465, 122.7717), false, false);
         Mat imInfo = (Mat_<float>(1, 3) << img.rows, img.cols, 1.6f);
 
-        net.setInput(blob, "data");
+        net.setInput(blob);
         net.setInput(imInfo, "im_info");
         // Output has shape 1x1xNx7 where N - number of detections.
         // An every detection is a vector of values [id, classId, confidence, left, top, right, bottom]
@@ -82,6 +155,46 @@ public:
     }
 };
 
+std::set<std::string> Test_Caffe_nets::parser_deny_list;
+std::set<std::string> Test_Caffe_nets::global_deny_list;
+std::set<std::string> Test_Caffe_nets::opencv_deny_list;
+std::set<std::string> Test_Caffe_nets::opencl_fp16_deny_list;
+std::set<std::string> Test_Caffe_nets::opencl_deny_list;
+std::set<std::string> Test_Caffe_nets::cpu_deny_list;
+std::set<std::string> Test_Caffe_nets::classic_deny_list;
+
+static std::string getCurrentTestNameNoParams()
+{
+    const testing::TestInfo* info = testing::UnitTest::GetInstance()->current_test_info();
+    if (!info) return std::string();
+
+#if defined(GTEST_VERSION_MAJOR) && (GTEST_VERSION_MAJOR > 1 || (GTEST_VERSION_MAJOR == 1 && GTEST_VERSION_MINOR >= 10))
+    const char* suite = info->test_suite_name();
+#else
+    const char* suite = info->test_case_name();
+#endif
+
+    std::string name = std::string(suite ? suite : "") + "." + info->name();
+    // Parametrized tests append "/<idx>" - strip that suffix for denylist matching.
+    const size_t pos = name.find('/');
+    if (pos != std::string::npos)
+        name.resize(pos);
+    return name;
+}
+
+static void skipIfInCaffeNewEngineDenylist()
+{
+    static bool isInitialized = false;
+    if (!isInitialized)
+    {
+        Test_Caffe_nets::SetUpTestCase();
+        isInitialized = true;
+    }
+    const std::string name = getCurrentTestNameNoParams();
+    if (!name.empty() && Test_Caffe_nets::global_deny_list.find(name) != Test_Caffe_nets::global_deny_list.end())
+        throw SkipTestException("Test is in the new engine denylist: " + name);
+}
+
 TEST(Test_Caffe, memory_read)
 {
     const string proto = findDataFile("dnn/bvlc_googlenet.prototxt");
@@ -89,33 +202,37 @@ TEST(Test_Caffe, memory_read)
 
     std::vector<char> dataProto;
     readFileContent(proto, dataProto);
+    std::vector<uchar> vecProto(dataProto.begin(), dataProto.end());
 
     std::vector<char> dataModel;
     readFileContent(model, dataModel);
+    std::vector<uchar> vecModel(dataModel.begin(), dataModel.end());
 
-    Net net = readNetFromCaffe(dataProto.data(), dataProto.size());
+    Net net = readNet("caffe", std::vector<uchar>(), vecProto);
     net.setPreferableBackend(DNN_BACKEND_OPENCV);
     ASSERT_FALSE(net.empty());
 
-    Net net2 = readNetFromCaffe(dataProto.data(), dataProto.size(),
-                                dataModel.data(), dataModel.size());
+    Net net2 = readNet("caffe", vecModel, vecProto);
     ASSERT_FALSE(net2.empty());
 }
 
 TEST(Test_Caffe, read_gtsrb)
 {
-    Net net = readNetFromCaffe(_tf("gtsrb.prototxt"));
+    skipIfInCaffeNewEngineDenylist();
+    Net net = readNet(_tf("gtsrb.prototxt"), "", "caffe");
     ASSERT_FALSE(net.empty());
 }
 
 TEST(Test_Caffe, read_googlenet)
 {
-    Net net = readNetFromCaffe(_tf("bvlc_googlenet.prototxt"));
+    skipIfInCaffeNewEngineDenylist();
+    Net net = readNet(_tf("bvlc_googlenet.prototxt"), "", "caffe");
     ASSERT_FALSE(net.empty());
 }
 
 TEST_P(Test_Caffe_nets, Axpy)
 {
+    skipIfInCaffeNewEngineDenylist();
 #if defined(INF_ENGINE_RELEASE) && INF_ENGINE_VER_MAJOR_LT(2021040000)
     if (backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NN_BUILDER);
@@ -124,7 +241,7 @@ TEST_P(Test_Caffe_nets, Axpy)
 #endif
 
     String proto = _tf("axpy.prototxt");
-    Net net = readNetFromCaffe(proto);
+    Net net = readNet(proto);
 
     checkBackend();
     net.setPreferableBackend(backend);
@@ -141,7 +258,7 @@ TEST_P(Test_Caffe_nets, Axpy)
 
     net.setInput(scale, "scale");
     net.setInput(shift, "shift");
-    net.setInput(inp, "data");
+    net.setInput(inp);
 
     Mat out = net.forward();
 
@@ -175,87 +292,12 @@ TEST_P(Test_Caffe_nets, Axpy)
     normAssert(ref, out, "", l1, lInf);
 }
 
-typedef testing::TestWithParam<tuple<bool, Target> > Reproducibility_AlexNet;
-TEST_P(Reproducibility_AlexNet, Accuracy)
-{
-    Target targetId = get<1>(GetParam());
-#if defined(OPENCV_32BIT_CONFIGURATION) && defined(HAVE_OPENCL)
-    applyTestTag(CV_TEST_TAG_MEMORY_2GB);
-#else
-    applyTestTag(targetId == DNN_TARGET_CPU ? CV_TEST_TAG_MEMORY_512MB : CV_TEST_TAG_MEMORY_1GB);
-#endif
-    ASSERT_TRUE(ocl::useOpenCL() || targetId == DNN_TARGET_CPU || targetId == DNN_TARGET_CPU_FP16);
-
-    bool readFromMemory = get<0>(GetParam());
-    Net net;
-    {
-        const string proto = findDataFile("dnn/bvlc_alexnet.prototxt");
-        const string model = findDataFile("dnn/bvlc_alexnet.caffemodel", false);
-        if (readFromMemory)
-        {
-            std::vector<char> dataProto;
-            readFileContent(proto, dataProto);
-            std::vector<char> dataModel;
-            readFileContent(model, dataModel);
-
-            net = readNetFromCaffe(dataProto.data(), dataProto.size(),
-                                   dataModel.data(), dataModel.size());
-        }
-        else
-            net = readNetFromCaffe(proto, model);
-        ASSERT_FALSE(net.empty());
-    }
-
-    // Test input layer size
-    std::vector<MatShape> inLayerShapes;
-    std::vector<MatShape> outLayerShapes;
-    net.getLayerShapes(MatShape(), CV_32F, 0, inLayerShapes, outLayerShapes);
-    ASSERT_FALSE(inLayerShapes.empty());
-    ASSERT_EQ(inLayerShapes[0].size(), 4);
-    ASSERT_EQ(inLayerShapes[0][0], 1);
-    ASSERT_EQ(inLayerShapes[0][1], 3);
-    ASSERT_EQ(inLayerShapes[0][2], 227);
-    ASSERT_EQ(inLayerShapes[0][3], 227);
-
-    const float l1 = 1e-5;
-    const float lInf = (targetId == DNN_TARGET_OPENCL_FP16 || targetId == DNN_TARGET_CPU_FP16) ? 4e-3 : 1e-4;
-
-    net.setPreferableBackend(DNN_BACKEND_OPENCV);
-    net.setPreferableTarget(targetId);
-
-    if (targetId == DNN_TARGET_CPU_FP16)
-        net.enableWinograd(false);
-
-    Mat sample = imread(_tf("grace_hopper_227.png"));
-    ASSERT_TRUE(!sample.empty());
-
-    net.setInput(blobFromImage(sample, 1.0f, Size(227, 227), Scalar(), false), "data");
-
-    Mat out;
-    // BUG: https://github.com/opencv/opencv/issues/26349
-    if (net.getMainGraph())
-        out = net.forward();
-    else
-        out = net.forward("prob");
-
-    Mat ref = blobFromNPY(_tf("caffe_alexnet_prob.npy"));
-    normAssert(ref, out, "", l1, lInf);
-}
-
-INSTANTIATE_TEST_CASE_P(/**/, Reproducibility_AlexNet, Combine(testing::Bool(),
-                        testing::ValuesIn(getAvailableTargets(DNN_BACKEND_OPENCV))));
-
 TEST(Reproducibility_FCN, Accuracy)
 {
     applyTestTag(CV_TEST_TAG_LONG, CV_TEST_TAG_DEBUG_VERYLONG, CV_TEST_TAG_MEMORY_2GB);
 
-    Net net;
-    {
-        const string proto = findDataFile("dnn/fcn8s-heavy-pascal.prototxt");
-        const string model = findDataFile("dnn/fcn8s-heavy-pascal.caffemodel", false);
-        net = readNetFromCaffe(proto, model);
-        ASSERT_FALSE(net.empty());
-    }
+    Net net = readNetFromONNX(findDataFile("dnn/fcn8s.onnx", false), ENGINE_CLASSIC);
+    ASSERT_FALSE(net.empty());
     net.setPreferableBackend(DNN_BACKEND_OPENCV);
 
     Mat sample = imread(_tf("street.png"));
@@ -265,14 +307,9 @@ TEST(Reproducibility_FCN, Accuracy)
     std::vector<size_t> weights, blobs;
     net.getMemoryConsumption(shape(1,3,227,227), CV_32F, layerIds, weights, blobs);
 
-    net.setInput(blobFromImage(sample, 1.0f, Size(500, 500), Scalar(), false), "data");
+    net.setInput(blobFromImage(sample, 1.0f, Size(500, 500), Scalar(), false));
 
-    Mat out;
-    // BUG: https://github.com/opencv/opencv/issues/26349
-    if (net.getMainGraph())
-        out = net.forward();
-    else
-        out = net.forward("score");
+    Mat out = net.forward();
 
     Mat refData = imread(_tf("caffe_fcn8s_prob.png"), IMREAD_ANYDEPTH);
     int shape[] = {1, 21, 500, 500};
@@ -288,13 +325,8 @@ TEST(Reproducibility_SSD, Accuracy)
         CV_TEST_TAG_DEBUG_VERYLONG
     );
 
-    Net net;
-    {
-        const string proto = findDataFile("dnn/ssd_vgg16.prototxt");
-        const string model = findDataFile("dnn/VGG_ILSVRC2016_SSD_300x300_iter_440000.caffemodel", false);
-        net = readNetFromCaffe(proto, model);
-        ASSERT_FALSE(net.empty());
-    }
+    Net net = readNetFromONNX(findDataFile("dnn/ssd_vgg16.onnx", false), ENGINE_CLASSIC);
+    ASSERT_FALSE(net.empty());
     net.setPreferableBackend(DNN_BACKEND_OPENCV);
 
     Mat sample = imread(_tf("street.png"));
@@ -304,14 +336,9 @@ TEST(Reproducibility_SSD, Accuracy)
         cvtColor(sample, sample, COLOR_BGRA2BGR);
 
     Mat in_blob = blobFromImage(sample, 1.0f, Size(300, 300), Scalar(), false);
-    net.setInput(in_blob, "data");
+    net.setInput(in_blob);
 
-    // BUG: https://github.com/opencv/opencv/issues/26349
-    Mat out;
-    if(net.getMainGraph())
-        out = net.forward();
-    else
-        out = net.forward("detection_out");
+    Mat out = net.forward();
 
     Mat ref = blobFromNPY(_tf("ssd_out.npy"));
     normAssertDetections(ref, out, "", 0.06);
@@ -320,9 +347,8 @@ TEST(Reproducibility_SSD, Accuracy)
 typedef testing::TestWithParam<tuple<Backend, Target> > Reproducibility_MobileNet_SSD;
 TEST_P(Reproducibility_MobileNet_SSD, Accuracy)
 {
-    const string proto = findDataFile("dnn/MobileNetSSD_deploy_19e3ec3.prototxt", false);
-    const string model = findDataFile("dnn/MobileNetSSD_deploy_19e3ec3.caffemodel", false);
-    Net net = readNetFromCaffe(proto, model);
+    const string model = findDataFile("dnn/ssd_mobilenet_v1_12.onnx", false);
+    Net net = readNetFromONNX(model);
     int backendId = get<0>(GetParam());
     int targetId = get<1>(GetParam());
 
@@ -400,132 +426,6 @@ TEST_P(Reproducibility_MobileNet_SSD, Accuracy)
 }
 INSTANTIATE_TEST_CASE_P(/**/, Reproducibility_MobileNet_SSD, dnnBackendsAndTargets());
 
-typedef testing::TestWithParam<Target> Reproducibility_ResNet50;
-TEST_P(Reproducibility_ResNet50, Accuracy)
-{
-    Target targetId = GetParam();
-    applyTestTag(targetId == DNN_TARGET_CPU ? CV_TEST_TAG_MEMORY_512MB : CV_TEST_TAG_MEMORY_1GB);
-    ASSERT_TRUE(ocl::useOpenCL() || targetId == DNN_TARGET_CPU || targetId == DNN_TARGET_CPU_FP16);
-
-    Net net = readNetFromCaffe(findDataFile("dnn/ResNet-50-deploy.prototxt"),
-                               findDataFile("dnn/ResNet-50-model.caffemodel", false));
-
-    net.setPreferableBackend(DNN_BACKEND_OPENCV);
-    net.setPreferableTarget(targetId);
-
-    if (targetId == DNN_TARGET_CPU_FP16)
-        net.enableWinograd(false);
-
-    float l1 = (targetId == DNN_TARGET_OPENCL_FP16 || targetId == DNN_TARGET_CPU_FP16) ? 3e-5 : 1e-5;
-    float lInf = (targetId == DNN_TARGET_OPENCL_FP16 || targetId == DNN_TARGET_CPU_FP16) ? 6e-3 : 1e-4;
-
-    Mat input = blobFromImage(imread(_tf("googlenet_0.png")), 1.0f, Size(224,224), Scalar(), false);
-    ASSERT_TRUE(!input.empty());
-
-    net.setInput(input);
-    Mat out = net.forward();
-
-    Mat ref = blobFromNPY(_tf("resnet50_prob.npy"));
-    normAssert(ref, out, "", l1, lInf);
-
-    if (targetId == DNN_TARGET_OPENCL || targetId == DNN_TARGET_OPENCL_FP16)
-    {
-        UMat out_umat;
-        net.forward(out_umat);
-        normAssert(ref, out_umat, "out_umat", l1, lInf);
-
-        std::vector<UMat> out_umats;
-        net.forward(out_umats);
-        normAssert(ref, out_umats[0], "out_umat_vector", l1, lInf);
-    }
-}
-INSTANTIATE_TEST_CASE_P(/**/, Reproducibility_ResNet50,
-                        testing::ValuesIn(getAvailableTargets(DNN_BACKEND_OPENCV)));
-
-typedef testing::TestWithParam<Target> Reproducibility_SqueezeNet_v1_1;
-TEST_P(Reproducibility_SqueezeNet_v1_1, Accuracy)
-{
-    int targetId = GetParam();
-    if(targetId == DNN_TARGET_OPENCL_FP16)
-        applyTestTag(CV_TEST_TAG_DNN_SKIP_OPENCL_FP16);
-    if(targetId == DNN_TARGET_CPU_FP16)
-        applyTestTag(CV_TEST_TAG_DNN_SKIP_CPU_FP16);
-    Net net = readNetFromCaffe(findDataFile("dnn/squeezenet_v1.1.prototxt"),
-                               findDataFile("dnn/squeezenet_v1.1.caffemodel", false));
-    net.setPreferableBackend(DNN_BACKEND_OPENCV);
-    net.setPreferableTarget(targetId);
-
-    Mat input = blobFromImage(imread(_tf("googlenet_0.png")), 1.0f, Size(227,227), Scalar(), false, true);
-    ASSERT_TRUE(!input.empty());
-
-    Mat out;
-    if (targetId == DNN_TARGET_OPENCL)
-    {
-        // Firstly set a wrong input blob and run the model to receive a wrong output.
-        // Then set a correct input blob to check CPU->GPU synchronization is working well.
-        net.setInput(input * 2.0f);
-        out = net.forward();
-    }
-    net.setInput(input);
-    out = net.forward();
-
-    Mat ref = blobFromNPY(_tf("squeezenet_v1.1_prob.npy"));
-    normAssert(ref, out);
-}
-INSTANTIATE_TEST_CASE_P(/**/, Reproducibility_SqueezeNet_v1_1,
-    testing::ValuesIn(getAvailableTargets(DNN_BACKEND_OPENCV)));
-
-TEST(Reproducibility_AlexNet_fp16, Accuracy)
-{
-    applyTestTag(CV_TEST_TAG_MEMORY_512MB);
-    const float l1 = 1e-5;
-    const float lInf = 3e-3;
-
-    const string proto = findDataFile("dnn/bvlc_alexnet.prototxt");
-    const string model = findDataFile("dnn/bvlc_alexnet.caffemodel", false);
-
-    shrinkCaffeModel(model, "bvlc_alexnet.caffemodel_fp16");
-    Net net = readNetFromCaffe(proto, "bvlc_alexnet.caffemodel_fp16");
-    net.setPreferableBackend(DNN_BACKEND_OPENCV);
-
-    Mat sample = imread(findDataFile("dnn/grace_hopper_227.png"));
-
-    net.setInput(blobFromImage(sample, 1.0f, Size(227, 227), Scalar()));
-    Mat out = net.forward();
-    Mat ref = blobFromNPY(findDataFile("dnn/caffe_alexnet_prob.npy"));
-    normAssert(ref, out, "", l1, lInf);
-}
-
-TEST(Reproducibility_GoogLeNet_fp16, Accuracy)
-{
-    const float l1 = 1e-5;
-    const float lInf = 3e-3;
-
-    const string proto = findDataFile("dnn/bvlc_googlenet.prototxt");
-    const string model = findDataFile("dnn/bvlc_googlenet.caffemodel", false);
-
-    shrinkCaffeModel(model, "bvlc_googlenet.caffemodel_fp16");
-    Net net = readNetFromCaffe(proto, "bvlc_googlenet.caffemodel_fp16");
-    net.setPreferableBackend(DNN_BACKEND_OPENCV);
-
-    std::vector<Mat> inpMats;
-    inpMats.push_back( imread(_tf("googlenet_0.png")) );
-    inpMats.push_back( imread(_tf("googlenet_1.png")) );
-    ASSERT_TRUE(!inpMats[0].empty() && !inpMats[1].empty());
-
-    net.setInput(blobFromImages(inpMats, 1.0f, Size(), Scalar(), false), "data");
-
-    // BUG: https://github.com/opencv/opencv/issues/26349
-    Mat out;
-    if(net.getMainGraph())
-        out = net.forward();
-    else
-        out = net.forward("prob");
-
-    Mat ref = blobFromNPY(_tf("googlenet_prob.npy"));
-    normAssert(out, ref, "", l1, lInf);
-}
-
 // https://github.com/richzhang/colorization
 TEST_P(Test_Caffe_nets, Colorization)
 {
@@ -539,9 +439,8 @@ TEST_P(Test_Caffe_nets, Colorization)
     Mat ref = blobFromNPY(_tf("colorization_out.npy"));
     Mat kernel = blobFromNPY(_tf("colorization_pts_in_hull.npy"));
 
-    const string proto = findDataFile("dnn/colorization_deploy_v2.prototxt", false);
-    const string model = findDataFile("dnn/colorization_release_v2.caffemodel", false);
-    Net net = readNetFromCaffe(proto, model);
+    const string model = findDataFile("dnn/colorization_deploy_v2.onnx", false);
+    Net net = readNetFromONNX(model, ENGINE_CLASSIC);
     net.setPreferableBackend(backend);
     net.setPreferableTarget(target);
 
@@ -549,8 +448,8 @@ TEST_P(Test_Caffe_nets, Colorization)
     if (target == DNN_TARGET_CPU_FP16)
         net.enableWinograd(false);
 
-    net.getLayer(net.getLayerId("class8_ab"))->blobs.push_back(kernel);
-    net.getLayer(net.getLayerId("conv8_313_rh"))->blobs.push_back(Mat(1, 313, CV_32F, 2.606));
+    // net.getLayer(net.getLayerId("class8_ab"))->blobs.push_back(kernel);
+    // net.getLayer(net.getLayerId("conv8_313_rh"))->blobs.push_back(Mat(1, 313, CV_32F, 2.606));
 
     net.setInput(inp);
     Mat out = net.forward();
@@ -630,8 +529,9 @@ TEST_P(Test_Caffe_nets, DenseNet_121)
 
 TEST(Test_Caffe, multiple_inputs)
 {
+    skipIfInCaffeNewEngineDenylist();
     const string proto = findDataFile("dnn/layers/net_input.prototxt");
-    Net net = readNetFromCaffe(proto);
+    Net net = readNet(proto, "", "", ENGINE_CLASSIC);
     net.setPreferableBackend(DNN_BACKEND_OPENCV);
 
     Mat first_image(10, 11, CV_32FC3);
@@ -658,10 +558,11 @@ TEST(Test_Caffe, multiple_inputs)
 
 TEST(Test_Caffe, shared_weights)
 {
+  skipIfInCaffeNewEngineDenylist();
   const string proto = findDataFile("dnn/layers/shared_weights.prototxt");
   const string model = findDataFile("dnn/layers/shared_weights.caffemodel");
 
-  Net net = readNetFromCaffe(proto, model);
+  Net net = readNet(proto, model);
 
   Mat input_1 = (Mat_<float>(2, 2) << 0., 2., 4., 6.);
   Mat input_2 = (Mat_<float>(2, 2) << 1., 3., 5., 7.);
@@ -691,7 +592,7 @@ TEST_P(opencv_face_detector, Accuracy)
     if (targetId == DNN_TARGET_CPU_FP16)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_CPU_FP16);
 
-    Net net = readNetFromCaffe(proto, model);
+    Net net = readNet(proto, model);
     Mat img = imread(findDataFile("gpu/lbpcascade/er.png"));
     Mat blob = blobFromImage(img, 1.0, Size(), Scalar(104.0, 177.0, 123.0), false, false);
 
@@ -723,7 +624,7 @@ TEST_P(opencv_face_detector, issue_15106)
     if (targetId == DNN_TARGET_CPU_FP16)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_CPU_FP16);
 
-    Net net = readNetFromCaffe(proto, model);
+    Net net = readNet(proto, model);
     Mat img = imread(findDataFile("cv/shared/lena.png"));
     img = img.rowRange(img.rows / 4, 3 * img.rows / 4).colRange(img.cols / 4, 3 * img.cols / 4);
     Mat blob = blobFromImage(img, 1.0, Size(300, 300), Scalar(104.0, 177.0, 123.0), false, false);

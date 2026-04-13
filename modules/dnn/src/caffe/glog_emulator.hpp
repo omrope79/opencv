@@ -1,106 +1,134 @@
-/*M///////////////////////////////////////////////////////////////////////////////////////
-//
-//  IMPORTANT: READ BEFORE DOWNLOADING, COPYING, INSTALLING OR USING.
-//
-//  By downloading, copying, installing or using the software you agree to this license.
-//  If you do not agree to this license, do not download, install,
-//  copy or use the software.
-//
-//
-//                           License Agreement
-//                For Open Source Computer Vision Library
-//
-// Copyright (C) 2013, OpenCV Foundation, all rights reserved.
-// Third party copyrights are property of their respective owners.
-//
-// Redistribution and use in source and binary forms, with or without modification,
-// are permitted provided that the following conditions are met:
-//
-//   * Redistribution's of source code must retain the above copyright notice,
-//     this list of conditions and the following disclaimer.
-//
-//   * Redistribution's in binary form must reproduce the above copyright notice,
-//     this list of conditions and the following disclaimer in the documentation
-//     and/or other materials provided with the distribution.
-//
-//   * The name of the copyright holders may not be used to endorse or promote products
-//     derived from this software without specific prior written permission.
-//
-// This software is provided by the copyright holders and contributors "as is" and
-// any express or implied warranties, including, but not limited to, the implied
-// warranties of merchantability and fitness for a particular purpose are disclaimed.
-// In no event shall the Intel Corporation or contributors be liable for any direct,
-// indirect, incidental, special, exemplary, or consequential damages
-// (including, but not limited to, procurement of substitute goods or services;
-// loss of use, data, or profits; or business interruption) however caused
-// and on any theory of liability, whether in contract, strict liability,
-// or tort (including negligence or otherwise) arising in any way out of
-// the use of this software, even if advised of the possibility of such damage.
-//
-//M*/
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
 
-#ifndef __OPENCV_DNN_CAFFE_GLOG_EMULATOR_HPP__
-#define __OPENCV_DNN_CAFFE_GLOG_EMULATOR_HPP__
-#include <cstdlib>
-#include <iostream>
+#ifndef OPENCV_DNN_GLOG_EMULATOR_HPP
+#define OPENCV_DNN_GLOG_EMULATOR_HPP
+
+#include <opencv2/core/base.hpp>
+
 #include <sstream>
-#include <opencv2/core.hpp>
+#include <string>
 
-#define CHECK(cond)     for(cv::dnn::GLogWrapper _logger(__FILE__, CV_Func, __LINE__, "CHECK", #cond, cond); _logger.exit(); _logger.check()) _logger.stream()
-#define CHECK_EQ(a, b)  for(cv::dnn::GLogWrapper _logger(__FILE__, CV_Func, __LINE__, "CHECK", #a"="#b, ((a) == (b))); _logger.exit(); _logger.check()) _logger.stream()
-#define LOG(TYPE)       for(cv::dnn::GLogWrapper _logger(__FILE__, CV_Func, __LINE__, #TYPE); _logger.exit(); _logger.check()) _logger.stream()
+namespace cv {
+namespace dnn {
+namespace detail {
 
-namespace cv
+enum LogSeverity
 {
-namespace dnn
-{
-
-class GLogWrapper
-{
-    const char *file, *func, *type, *cond_str;
-    int line;
-    bool cond_status, exit_loop;
-    std::stringstream sstream;
-
-public:
-
-    GLogWrapper(const char *_file, const char *_func, int _line,
-          const char *_type,
-          const char *_cond_str = NULL, bool _cond_status = true
-    ) :
-        file(_file), func(_func), type(_type), cond_str(_cond_str),
-        line(_line), cond_status(_cond_status), exit_loop(true) {}
-
-    std::iostream &stream()
-    {
-        return sstream;
-    }
-
-    bool exit()
-    {
-        return exit_loop;
-    }
-
-    void check()
-    {
-        exit_loop = false;
-
-        if (cond_str && !cond_status)
-        {
-            cv::error(cv::Error::StsError, "FAILED: " + String(cond_str) + ". " + sstream.str(), func, file, line);
-        }
-        else if (!cond_str && strcmp(type, "CHECK"))
-        {
-            #ifndef NDEBUG
-            if (!std::strcmp(type, "INFO"))
-                std::cout << sstream.str() << std::endl;
-            else
-                std::cerr << sstream.str() << std::endl;
-            #endif
-        }
-    }
+    INFO = 0,
+    WARNING = 1,
+    ERROR = 2,
+    FATAL = 3
 };
 
-}
-}
-#endif
+class CheckStream
+{
+public:
+    CheckStream(bool failed, const char* expr, const char* file, int line)
+        : failed_(failed)
+    {
+        if (failed_)
+            stream_ << file << ":" << line << ": Check failed: " << expr;
+    }
+
+    ~CheckStream()
+    {
+        if (failed_)
+        {
+            const std::string msg = stream_.str();
+            CV_Error_(cv::Error::StsError, ("%s", msg.c_str()));
+        }
+    }
+
+    template <typename T>
+    CheckStream& operator<<(const T& value)
+    {
+        if (failed_)
+            stream_ << value;
+        return *this;
+    }
+
+    CheckStream& operator<<(std::ostream& (*manip)(std::ostream&))
+    {
+        if (failed_)
+            manip(stream_);
+        return *this;
+    }
+
+    CheckStream& operator<<(std::ios_base& (*manip)(std::ios_base&))
+    {
+        if (failed_)
+            manip(stream_);
+        return *this;
+    }
+
+private:
+    bool failed_;
+    std::ostringstream stream_;
+};
+
+class LogStream
+{
+public:
+    LogStream(LogSeverity severity, const char* file, int line)
+        : severity_(severity)
+    {
+        stream_ << file << ":" << line << ": ";
+    }
+
+    ~LogStream()
+    {
+        if (severity_ == FATAL)
+        {
+            const std::string msg = stream_.str();
+            CV_Error_(cv::Error::StsError, ("%s", msg.c_str()));
+        }
+    }
+
+    template <typename T>
+    LogStream& operator<<(const T& value)
+    {
+        stream_ << value;
+        return *this;
+    }
+
+    LogStream& operator<<(std::ostream& (*manip)(std::ostream&))
+    {
+        manip(stream_);
+        return *this;
+    }
+
+    LogStream& operator<<(std::ios_base& (*manip)(std::ios_base&))
+    {
+        manip(stream_);
+        return *this;
+    }
+
+private:
+    LogSeverity severity_;
+    std::ostringstream stream_;
+};
+
+}  // namespace detail
+}  // namespace dnn
+}  // namespace cv
+
+#define LOG(severity) \
+    cv::dnn::detail::LogStream(cv::dnn::detail::severity, __FILE__, __LINE__)
+
+#define CHECK(condition) \
+    cv::dnn::detail::CheckStream(!(condition), #condition, __FILE__, __LINE__)
+
+#define CHECK_OP(op, val1, val2) \
+    cv::dnn::detail::CheckStream(!((val1) op (val2)), #val1 " " #op " " #val2, __FILE__, __LINE__) \
+        << " (" << (val1) << " vs " << (val2) << ")"
+
+#define CHECK_EQ(val1, val2) CHECK_OP(==, val1, val2)
+#define CHECK_NE(val1, val2) CHECK_OP(!=, val1, val2)
+#define CHECK_LT(val1, val2) CHECK_OP(<, val1, val2)
+#define CHECK_LE(val1, val2) CHECK_OP(<=, val1, val2)
+#define CHECK_GT(val1, val2) CHECK_OP(>, val1, val2)
+#define CHECK_GE(val1, val2) CHECK_OP(>=, val1, val2)
+
+#endif  // OPENCV_DNN_GLOG_EMULATOR_HPP
