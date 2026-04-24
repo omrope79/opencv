@@ -109,6 +109,9 @@ public:
             int64_t autoSize = inpTotal/outTotal;
             CV_Assert(autoSize <= INT_MAX && autoSize*outTotal == inpTotal);
             outShape[m1idx] = (int)autoSize;
+        } else if (outTotal != inpTotal && ndims == 2 && outShape[0] == 1 && outShape[1] > 0) {
+            // Caffe→ONNX exports [1, N] with N fixed at training resolution; infer N at runtime instead.
+            outShape[1] = (int)(inpTotal / outShape[0]);
         } else {
             CV_Assert(outTotal == inpTotal);
         }
