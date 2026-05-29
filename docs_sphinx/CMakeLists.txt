@@ -20,11 +20,40 @@ if(NOT SPHINX_BUILD)
   return()
 endif()
 
+# Graphviz `dot` — required for the collaboration-diagram images on API
+# class pages. The diagrams come from the legacy Doxygen HTML build, which
+# only emits `<refid>__coll__graph.svg` (conf.py inlines + recolours them for
+# dark mode) when Doxygen runs with HAVE_DOT=YES — and that flag is set by
+# find_package(Doxygen) in opencv/doc/CMakeLists.txt only when `dot` is on
+# PATH. So installing graphviz and re-running cmake is all that's needed;
+# we surface a clear, actionable message when it's missing rather than
+# silently shipping diagram-less class pages.
+find_program(DOT_EXECUTABLE NAMES dot
+  DOC "Path to graphviz `dot` (required for API collaboration diagrams)")
+if(NOT DOT_EXECUTABLE)
+  message(WARNING
+    "docs_sphinx: graphviz `dot` not found — API class-page collaboration "
+    "diagrams will be skipped. Install graphviz (e.g. `sudo apt-get install "
+    "graphviz`) and re-run cmake so the Doxygen HTML build enables HAVE_DOT.")
+else()
+  message(STATUS
+    "docs_sphinx: graphviz dot found (${DOT_EXECUTABLE}) — "
+    "collaboration diagrams enabled")
+endif()
+
 set(_SPHINX_CONFDIR    "${CMAKE_CURRENT_SOURCE_DIR}")
 set(_SPHINX_OUTDIR     "${CMAKE_CURRENT_BINARY_DIR}/html")
 set(_SPHINX_INPUT_ROOT "${CMAKE_CURRENT_BINARY_DIR}/docs_sphinx_input")
 
-# Stage merged input tree: symlink main + contrib tutorial subtrees into one srcdir.
+# ---------------------------------------------------------------------------
+# Stage a merged input tree at ${CMAKE_BINARY_DIR}/docs_sphinx_input/.
+# Sphinx requires a single srcdir, but the wrapper needs to see both
+# opencv/doc/tutorials/ and (optionally) opencv_contrib/modules/<m>/tutorials/.
+# We symlink each main module subtree under tutorials/ and each enabled contrib
+# module subtree under tutorials_contrib/, then auto-generate the contrib root
+# page — the same pattern opencv/doc/CMakeLists.txt already uses for Doxygen.
+# Nothing under opencv/doc/ or opencv_contrib/modules/ is modified.
+# ---------------------------------------------------------------------------
 set(_SPHINX_INPUT_TUTORIALS "${_SPHINX_INPUT_ROOT}/tutorials")
 set(_SPHINX_INPUT_CONTRIB   "${_SPHINX_INPUT_ROOT}/tutorials_contrib")
 file(REMOVE_RECURSE "${_SPHINX_INPUT_ROOT}")
@@ -72,7 +101,14 @@ foreach(_root js_tutorials py_tutorials images)
   endif()
 endforeach()
 
-# Contrib tree: stage when OPENCV_EXTRA_MODULES_PATH is set; unselected modules dropped by conf.py.
+# Contrib tree: only when OPENCV_EXTRA_MODULES_PATH is set, matching the legacy
+# Doxygen contrib build's activation gate exactly. Stage every contrib module
+# that has a tutorials/ dir — the canonical "which modules to compile" list
+# lives in conf.py's CONTRIB_MODULES, exactly parallel to DOC_MODULES for main.
+# Staged-but-unselected modules have their @subpage entries silently dropped
+# by the toctree machinery (conf.py only populates _ANCHOR_TO_DOC for enabled
+# modules), so listing them all in contrib_root.markdown is safe and means
+# adding a new contrib module is a one-line conf.py edit (no reconfigure).
 if(OPENCV_EXTRA_MODULES_PATH AND EXISTS "${OPENCV_EXTRA_MODULES_PATH}")
   file(MAKE_DIRECTORY "${_SPHINX_INPUT_CONTRIB}")
   set(_contrib_root_md "${_SPHINX_INPUT_CONTRIB}/contrib_root.markdown")
@@ -112,10 +148,26 @@ set(_LEGACY_DOXYFILE "${CMAKE_BINARY_DIR}/doc/Doxyfile")
 set(_DOXYGEN_XML_DIR "${CMAKE_BINARY_DIR}/doc/doxygen/xml")
 
 # Modules to process with Doxygen — must match OPENCV_API_MODULES used at
-# sphinx-build time. Default "core" matches conf.py's OPENCV_API_MODULES default.
+# sphinx-build time. Default = every main module whose umbrella header
+# (modules/<m>/include/opencv2/<m>.hpp) declares `@defgroup`, discovered the
+# same way conf.py's _discover_api_modules() does so the two stay in sync and
+# new modules are picked up automatically.
 # Override: cmake -DSPHINX_API_MODULES="core;photo;imgproc;objdetect;3d"
 if(NOT DEFINED SPHINX_API_MODULES)
-  set(SPHINX_API_MODULES "core")
+  set(SPHINX_API_MODULES "")
+  file(GLOB _umbrella_headers "${CMAKE_SOURCE_DIR}/modules/*/include/opencv2/*.hpp")
+  foreach(_hdr ${_umbrella_headers})
+    get_filename_component(_stem "${_hdr}" NAME_WE)
+    # Only the umbrella header modules/<m>/include/opencv2/<m>.hpp.
+    if(_hdr MATCHES "/modules/${_stem}/include/opencv2/${_stem}\\.hpp$")
+      file(READ "${_hdr}" _hdr_contents)
+      if(_hdr_contents MATCHES "@defgroup")
+        list(APPEND SPHINX_API_MODULES "${_stem}")
+      endif()
+    endif()
+  endforeach()
+  list(SORT SPHINX_API_MODULES)
+  message(STATUS "docs_sphinx: discovered API modules: ${SPHINX_API_MODULES}")
 endif()
 set(_doxy_input "")
 foreach(_m ${SPHINX_API_MODULES})
@@ -220,6 +272,19 @@ endif()
 # Auto-generate Python binding signatures (needed for Python names in enum tables).
 if(TARGET gen_opencv_python_source)
   add_dependencies(sphinx gen_opencv_python_source)
+endif()
+# Collaboration-diagram SVGs on API class pages come from the legacy Doxygen
+# HTML build (conf.py reads <refid>__coll__graph.svg from doc/doxygen/html and
+# inlines + dark-recolours it). Depend on the `doxygen` target so the SVGs are
+# regenerated automatically on `cmake --build <build> --target sphinx` — no
+# separate `--target doxygen` step. Requires graphviz `dot` (see DOT_EXECUTABLE
+# check above); without it Doxygen emits no graphs and the diagram is omitted.
+# NOTE: the Doxygen HTML pass is heavy and stamp-less, so it re-runs each sphinx
+# build. Set -DSPHINX_BUILD_DIAGRAMS=OFF to skip it for fast tutorial-only runs.
+option(SPHINX_BUILD_DIAGRAMS
+  "Rebuild the Doxygen HTML (collaboration diagrams) as part of the sphinx target" ON)
+if(SPHINX_BUILD_DIAGRAMS AND TARGET doxygen)
+  add_dependencies(sphinx doxygen)
 endif()
 
 # Clean rebuild: `cmake --build <build> --target sphinx-clean`

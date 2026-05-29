@@ -28,6 +28,7 @@ from conf_helpers.state import (
     DOC_ROOT, CONTRIB_ROOT, SPHINX_INPUT_ROOT,
     DOC_MODULES, JS_DOC_MODULES, PY_DOC_MODULES, CONTRIB_MODULES, API_MODULES,
     DOXYGEN_BASE_URL, _doxygen_url, _PATCHED_XML_DIR, HAVE_BREATHE,
+    USE_INDEX_LANDING,
 )
 import conf_helpers.build      # noqa: F401  bib staging + anchor scans + API-stub
 #                                            generation + image/snippet indexing.
@@ -56,7 +57,14 @@ if HAVE_BREATHE:
     extensions.append("breathe")
     breathe_projects = {"opencv": str(_PATCHED_XML_DIR)}
     breathe_default_project = "opencv"
-    breathe_default_members = ("members",)
+    # No global members default: each class page renders its own summary tables
+    # + per-member detail blocks (see _write_class_stub), and the "Detailed
+    # Description" `{doxygenclass}` is meant to be description-only. A global
+    # `("members",)` default would force members back into that block —
+    # duplicating the hand-rolled member docs and feeding macro-bearing
+    # declarations (e.g. `CV_PROP_RW Point2f pt`) to the C++ domain parser. The
+    # missing-XML fallback passes `:members:` explicitly, so it's unaffected.
+    breathe_default_members = ()
 
 source_suffix = {".md": "markdown", ".markdown": "markdown"}
 
@@ -73,16 +81,25 @@ cpp_id_attributes = [
     "CV_NODISCARD_STD", "CV_NODISCARD",
     "CV_EXPORTS", "CV_EXPORTS_W",
     "CV_WRAP",
+    # Python-binding annotation macros (expand to nothing in C++): they prefix
+    # member/parameter declarations like `CV_PROP_RW Point2f pt` and otherwise
+    # raise "Invalid C++ declaration" when a `{doxygenclass} :members:` block
+    # (the missing-XML fallback) feeds them to the C++ domain parser.
+    "CV_PROP", "CV_PROP_RW", "CV_PROP_W",
+    "CV_OUT", "CV_IN_OUT",
 ]
 c_id_attributes = list(cpp_id_attributes)
 
-# Root tutorial index (lists all modules via @subpage). Stays the master
-# regardless of how many modules are in DOC_MODULES.
-master_doc = "tutorials/tutorials"
+# Master doc. By default the generated `index.markdown` landing page is the
+# site root (USE_INDEX_LANDING); its toctree lists every cross-family root and
+# its body is the OpenCV-modules link list. Setting the flag False falls back
+# to the legacy layout where `tutorials/tutorials` is the root.
+master_doc = "index" if USE_INDEX_LANDING else "tutorials/tutorials"
 
 # Source dir is the staged tree (or DOC_ROOT for legacy ad-hoc runs).
 # Scope: master + enabled main modules + (optionally) enabled contrib modules.
-include_patterns = ["tutorials/tutorials.markdown", "faq.markdown",
+include_patterns = (["index.markdown"] if USE_INDEX_LANDING else []) + [
+                    "tutorials/tutorials.markdown", "faq.markdown",
                     "citelist.markdown", "intro.markdown"] + [
     f"tutorials/{m}/**" for m in DOC_MODULES
 ] + (["js_tutorials/js_tutorials.markdown"] if JS_DOC_MODULES else []) + [
@@ -99,12 +116,17 @@ if API_MODULES:
     # so use a glob. The check happens at Sphinx source-enumeration time —
     # if no files exist, the pattern just matches nothing.
     include_patterns.append("api/**")
+    # Per-sample example pages (PR #7) written by `_generate_example_pages`
+    # alongside the class stubs. Each is `:orphan:`; the only inbound links are
+    # the `../examples/<name>.html` references baked into class pages by
+    # `_render_examples_block`. Without this glob Sphinx's include filter would
+    # drop the whole directory and the Examples links would 404.
+    include_patterns.append("examples/**")
 
 exclude_patterns = [
     "**/Thumbs.db", "**/.DS_Store", "**/_old/**",
     "tutorials/core/how_to_use_OpenCV_parallel_for_/**",
     "tutorials/introduction/load_save_image/**",
-    "tutorials/app/_old/**",
 ]
 
 myst_enable_extensions = [
@@ -116,6 +138,11 @@ suppress_warnings = [
     "myst.header", "myst.xref_missing", "toc.not_included",
     "misc.highlighting_failure",
     "image.not_readable",
+    # The same C++ symbol is legitimately declared on more than one generated
+    # page (e.g. a free function listed both on its group page and surfaced via
+    # a namespace page, or breathe re-emitting an `@ingroup` member). The C++
+    # domain warns on the redeclaration; it's expected here, not a doc error.
+    "cpp.duplicate_declaration",
 ]
 
 # -- HTML / PyData theme ----------------------------------------------------
@@ -136,11 +163,15 @@ html_css_files = [
 ]
 html_theme_options = {
     "logo": {"text": f"OpenCV {release}"},
-    # Show all 7 Doxygen-style external links inline (no "More" dropdown).
+    # Show all 7 Doxygen-style nav links inline (no "More" dropdown).
     "header_links_before_dropdown": 7,
     # Doxygen-style top-level nav (the legacy site's MAIN PAGE / RELATED
     # PAGES / NAMESPACES / CLASSES / FILES / EXAMPLES / JAVA DOCUMENTATION).
-    # All external — they target the existing Doxygen build.
+    # Declared via the theme's `external_links` slot only because that's the
+    # data hook for a custom header nav — but these are NOT external: the
+    # navbar-nav.html override rewrites each DOXYGEN_BASE_URL target to a
+    # relative path into the locally-built Doxygen output and renders them as
+    # in-tab links, so navigation stays on-site (see html_context below).
     "external_links": [
         {"url": _doxygen_url("index.html"),       "name": "Main Page"},
         {"url": _doxygen_url("pages.html"),       "name": "Related Pages"},
@@ -155,7 +186,10 @@ html_theme_options = {
     "show_prev_next": True,
     "show_nav_level": 2,
     "navigation_depth": 4,
-    "secondary_sidebar_items": ["page-toc"],
+    # Every page shows the in-page "On this page" TOC, except the generated
+    # landing page (index), where an empty list removes the secondary sidebar
+    # entirely so the centered entry list isn't pushed off to the left.
+    "secondary_sidebar_items": {"**": ["page-toc"], "index": []},
     "back_to_top_button": True,
     "show_version_warning_banner": False,
     "icon_links": [{"name": "GitHub",
