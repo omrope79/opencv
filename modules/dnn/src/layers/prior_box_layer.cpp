@@ -203,6 +203,14 @@ public:
         remap("min_sizes",     "min_size");
         remap("max_sizes",     "max_size");
         remap("aspect_ratios", "aspect_ratio");
+
+        if (p.has("steps") && !p.has("step_h") && !p.has("step_w")) {
+            DictValue steps = p.get("steps");
+            if (steps.size() == 2) {
+                p.set("step_h", steps.get<float>(0));
+                p.set("step_w", steps.get<float>(1));
+            }
+        }
         return p;
     }
 
@@ -451,7 +459,9 @@ public:
         inputs_arr.getMatVector(inputs);
         outputs_arr.getMatVector(outputs);
 
-        CV_Assert(inputs.size() == 2);
+        // PriorBox uses layer parameters and inputs[0]/inputs[1] shapes; tensor data is never read.
+        // Extra inputs (e.g., in ssd_vgg16.onnx) are ignored, so require >= 2 inputs instead of exactly 2.
+        CV_Assert(inputs.size() >= 2);
 
         int _layerWidth = inputs[0].size[3];
         int _layerHeight = inputs[0].size[2];
@@ -520,7 +530,9 @@ public:
 #ifdef HAVE_DNN_NGRAPH
     virtual Ptr<BackendNode> initNgraph(const std::vector<Ptr<BackendWrapper> >& inputs, const std::vector<Ptr<BackendNode> >& nodes) CV_OVERRIDE
     {
-        CV_Assert(nodes.size() == 2);
+        // PriorBox uses layer parameters and inputs[0]/inputs[1] shapes; tensor data is never read.
+        // Extra inputs (e.g., in ssd_vgg16.onnx) are ignored, so require >= 2 inputs instead of exactly 2.
+        CV_Assert(nodes.size() >= 2);
         auto layer = nodes[0].dynamicCast<InfEngineNgraphNode>()->node;
         auto image = nodes[1].dynamicCast<InfEngineNgraphNode>()->node;
         auto layer_shape = std::make_shared<ov::op::v3::ShapeOf>(layer);
