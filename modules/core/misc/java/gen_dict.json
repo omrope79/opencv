@@ -8,6 +8,9 @@
         "KeyPoint",
         "DMatch"
     ],
+    "const_ignore_list" : [
+        "SOLVELP_.*"
+    ],
     "missing_consts" : {
         "Core" : {
             "private" : [
@@ -29,6 +32,11 @@
     },
     "ManualFuncs" : {
         "Core" : {
+            "solveLP" : {
+                "j_code"   : [],
+                "jn_code"  : [],
+                "cpp_code" : []
+            },
             "minMaxLoc" : {
                 "j_code"   : [
                     "// manual port",

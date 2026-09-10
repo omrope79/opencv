@@ -2078,4 +2078,30 @@ public class CoreTest extends OpenCVTestCase {
         Core.setUseOptimized(original_status);
         assertEquals(original_status, Core.useOptimized());
     }
+
+    public void testLinearAssignment() {
+        Mat cost = new Mat(3, 3, CvType.CV_64FC1);
+        cost.put(0, 0, 4, 1, 3,
+                       2, 0, 5,
+                       3, 2, 2);
+
+        MatOfInt assignment = new MatOfInt();
+        double total = Core.linearAssignment(cost, assignment);
+
+        assertEquals(5.0, total, EPS);
+        assertListEquals(Arrays.asList(1, 0, 2), assignment.toList());
+    }
+
+    public void testLinearAssignmentWithThreshold() {
+        // Taking both pairs costs 20, while leaving one row unmatched costs the threshold, 10.
+        Mat cost = new Mat(2, 2, CvType.CV_64FC1);
+        cost.put(0, 0, 0, 10,
+                      10, 100);
+
+        MatOfInt assignment = new MatOfInt();
+        double total = Core.linearAssignment(cost, assignment, 10.0);
+
+        assertEquals(0.0, total, EPS);
+        assertListEquals(Arrays.asList(0, -1), assignment.toList());
+    }
 }
