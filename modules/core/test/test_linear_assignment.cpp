@@ -341,6 +341,63 @@ TEST(Core_LinearAssignment, known_optimum_large)
     }
 }
 
+// The dummy columns are skipped when nothing is forbidden and every cost is cheaper than the
+// price of not pairing. That is a different matrix shape reaching the solver, so sweep it on its
+// own rather than relying on a random matrix happening to contain no inf.
+TEST(Core_LinearAssignment, unpadded_path_vs_bruteforce)
+{
+    RNG rng(0xFEEDBEEF);
+    // 25.5 and 1e6 sit above the cost range, so no cell is forbidden and no cell can tie with
+    // the threshold; DBL_MAX is the default. All three take the skip.
+    const double thresholds[] = { 25.5, 1e6, DBL_MAX };
+
+    for (int iter = 0; iter < 2000; iter++)
+    {
+        const int M = rng.uniform(1, 7);
+        const int N = rng.uniform(1, 7);
+        Mat cost(M, N, CV_64F);
+        rng.fill(cost, RNG::UNIFORM, -5.0, 20.0);   // no inf, no NaN
+        const double thr = thresholds[rng.uniform(0, 3)];
+
+        std::vector<int> a;
+        const double total = cv::linearAssignment(cost, a, thr);
+        checkWellFormed(cost, a, thr);
+
+        int pairs;
+        double sum;
+        summarise(cost, a, pairs, sum);
+        EXPECT_EQ(std::min(M, N), pairs)
+            << "nothing is forbidden, so every row that can pair must pair\n" << cost;
+        EXPECT_NEAR(total, sum, 1e-9);
+
+        int refPairs;
+        double refCost;
+        bruteForce(cost, thr, refPairs, refCost);
+        EXPECT_EQ(refPairs, pairs) << "iteration " << iter << ", threshold " << thr;
+        EXPECT_NEAR(refCost, total, 1e-9) << "iteration " << iter << ", threshold " << thr;
+    }
+}
+
+// cost == costThreshold is a genuine tie: pairing scores the same as not pairing, so the
+// cardinality is not determined. Only the objective is, so that is all this asserts.
+TEST(Core_LinearAssignment, threshold_tie_objective)
+{
+    Mat cost = (Mat_<double>(2, 2) << 5, 5,
+                                      5, 5);
+    std::vector<int> a;
+    const double total = cv::linearAssignment(cost, a, 5.0);
+    checkWellFormed(cost, a, 5.0);
+
+    int pairs;
+    double sum;
+    summarise(cost, a, pairs, sum);
+
+    // Every pair costs exactly the price of leaving one unmade, so the objective is 10 whatever
+    // the solver picks.
+    const double objective = total + 5.0 * (2 - pairs);
+    EXPECT_NEAR(10.0, objective, 1e-9) << "pairs = " << pairs << ", total = " << total;
+}
+
 TEST(Core_LinearAssignment, types_and_errors)
 {
     Mat cost64 = (Mat_<double>(3, 4) << 5, 2, 8, 1,
@@ -359,6 +416,13 @@ TEST(Core_LinearAssignment, types_and_errors)
     EXPECT_ANY_THROW(cv::linearAssignment(Mat::zeros(3, 3, CV_8U), a64));
     EXPECT_ANY_THROW(cv::linearAssignment(Mat::zeros(3, 3, CV_32S), a64));
     EXPECT_ANY_THROW(cv::linearAssignment(Mat::zeros(3, 3, CV_32FC2), a64));
+
+    // A NaN threshold has no meaning: every comparison against it is false, so it would silently
+    // forbid everything rather than fail.
+    EXPECT_ANY_THROW(cv::linearAssignment(cost64, a64, NAN_D));
+
+    const int sizes[] = { 2, 2, 2 };
+    EXPECT_ANY_THROW(cv::linearAssignment(Mat(3, sizes, CV_64F, Scalar(0)), a64));
 }
 
 }} // namespace opencv_test::<anonymous>

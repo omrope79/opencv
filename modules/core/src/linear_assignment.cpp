@@ -45,6 +45,7 @@ static void solveJV(const Mat& work, std::vector<int>& colOfRow)
     std::vector<double> dist((size_t)ncols);
     std::vector<int> prevRow((size_t)ncols);
     std::vector<uchar> labelled((size_t)ncols);
+    std::vector<int> remaining((size_t)ncols);   // columns not yet labelled, in no order
 
     colOfRow.assign((size_t)nrows, -1);
 
@@ -52,6 +53,9 @@ static void solveJV(const Mat& work, std::vector<int>& colOfRow)
     {
         std::fill(dist.begin(), dist.end(), std::numeric_limits<double>::max());
         std::fill(labelled.begin(), labelled.end(), (uchar)0);
+        for (int j = 0; j < ncols; j++)
+            remaining[j] = j;
+        int nremaining = ncols;
 
         int row = freeRow;      // row currently being expanded
         double delta = 0.0;     // length of the shortest path found so far
@@ -60,30 +64,35 @@ static void solveJV(const Mat& work, std::vector<int>& colOfRow)
         while (sink < 0)
         {
             const double* rowPtr = work.ptr<double>(row);
-            for (int j = 0; j < ncols; j++)
+            const double urow = u[row];
+            // Relax and pick the nearest column in a single pass over the unlabelled ones. A
+            // settled column is swapped off the tail of `remaining` rather than skipped by a
+            // flag test, so it is never re-read.
+            int best = 0;
+            double bestDist = std::numeric_limits<double>::max();
+            for (int k = 0; k < nremaining; k++)
             {
-                if (labelled[j])
-                    continue;
-                const double cand = delta + rowPtr[j] - u[row] - v[j];
+                const int j = remaining[k];
+                const double cand = delta + rowPtr[j] - urow - v[j];
                 if (cand < dist[j])
                 {
                     dist[j] = cand;
                     prevRow[j] = row;
                 }
-            }
-
-            int next = -1;
-            for (int j = 0; j < ncols; j++)
-            {
-                if (!labelled[j] && (next < 0 || dist[j] < dist[next]))
-                    next = j;
+                if (dist[j] < bestDist)
+                {
+                    bestDist = dist[j];
+                    best = k;
+                }
             }
             // ncols >= nrows leaves at least one column free, and every cost is finite, so the
             // search can always reach it.
-            CV_Assert(next >= 0 && dist[next] < std::numeric_limits<double>::max());
+            CV_Assert(bestDist < std::numeric_limits<double>::max());
 
-            labelled[next] = 1;
-            delta = dist[next];
+            const int next = remaining[best];
+            remaining[best] = remaining[--nremaining];
+            labelled[next] = 1;    // still needed by the dual update below
+            delta = bestDist;
 
             if (rowOfCol[next] < 0)
                 sink = next;
@@ -153,6 +162,8 @@ double linearAssignment(InputArray _cost, std::vector<int>& assignment, double c
     // NaN through as allowed and poison every sum downstream.
     Mat allowed(nrows, nreal, CV_8U);
     double absSum = 0.0;
+    double maxCost = -std::numeric_limits<double>::max();
+    bool anyForbidden = false;
     for (int i = 0; i < nrows; i++)
     {
         const double* o = orig.ptr<double>(i);
@@ -162,7 +173,12 @@ double linearAssignment(InputArray _cost, std::vector<int>& assignment, double c
             const bool ok = isFiniteVal(o[j]) && o[j] <= costThreshold;
             a[j] = ok ? 1 : 0;
             if (ok)
+            {
                 absSum += std::abs(o[j]);
+                maxCost = std::max(maxCost, o[j]);
+            }
+            else
+                anyForbidden = true;
         }
     }
 
@@ -178,13 +194,31 @@ double linearAssignment(InputArray _cost, std::vector<int>& assignment, double c
         dummy = costThreshold;
     CV_Assert(isFiniteVal(dummy));
 
-    // One dummy column per row, so a dummy is never contested. That is why a forbidden cell only
-    // has to lose to a dummy: a row sitting on one can always move to a free dummy, which is a
-    // single-row swap rather than an augmenting path, so dummy + 1 suffices.
-    const double forbidden = dummy + 1.0;
-    CV_Assert(isFiniteVal(forbidden));
+    // One dummy column per row, so a dummy is never contested: a row sitting on a forbidden cell
+    // can always move to a free dummy, which is a single-row swap rather than an augmenting path.
+    // Any margin at all is therefore enough, and even a tie is safe -- a row on a forbidden cell
+    // reports -1 exactly like a row on a dummy, and blocking a real column would force some other
+    // row onto a dummy at a further `dummy`, which no real-cost saving can repay.
+    //
+    // The margin still has to survive rounding, because dummy + 1.0 is dummy again once |dummy|
+    // passes 2^53, and dummy is 2*absSum + 1. Scale it with the magnitude so the separation the
+    // comment claims is one the code actually maintains.
+    const double forbidden = dummy + std::max(1.0, std::abs(dummy) * 1e-12);
+    CV_Assert(isFiniteVal(forbidden) && forbidden > dummy);
 
-    Mat work(nrows, nreal + nrows, CV_64F);
+    // The dummy columns are only reachable if the optimum can leave a row unmatched, and it never
+    // can when nothing is forbidden and every cost is cheaper than the price of not pairing:
+    // nrows <= nreal, so an unmatched row always has a free real column to take, and moving it
+    // there changes the objective by maxCost - dummy < 0. That is an append, not an augmentation,
+    // so no path argument is needed. Skipping them halves the column count on a plain square
+    // input, which is the common case.
+    //
+    // maxCost == dummy is excluded deliberately: it is the cost == costThreshold tie, where
+    // pairing and not pairing score the same and the dummy columns decide it.
+    const int ndummy = (anyForbidden || !(maxCost < dummy)) ? nrows : 0;
+    const int ncols = nreal + ndummy;
+
+    Mat work(nrows, ncols, CV_64F);
     for (int i = 0; i < nrows; i++)
     {
         const double* o = orig.ptr<double>(i);
@@ -192,7 +226,7 @@ double linearAssignment(InputArray _cost, std::vector<int>& assignment, double c
         double* w = work.ptr<double>(i);
         for (int j = 0; j < nreal; j++)
             w[j] = a[j] ? o[j] : forbidden;
-        for (int j = nreal; j < nreal + nrows; j++)
+        for (int j = nreal; j < ncols; j++)
             w[j] = dummy;
     }
 
