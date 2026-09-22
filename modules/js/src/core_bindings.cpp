@@ -474,6 +474,7 @@ EMSCRIPTEN_BINDINGS(binding_utils)
     register_vector<cv::Point3_<float>>("Point3fVector");
     register_vector<cv::Mat>("MatVector");
     register_vector<cv::Rect>("RectVector");
+    register_vector<cv::Rect2d>("Rect2dVector");
     register_vector<cv::KeyPoint>("KeyPointVector");
     register_vector<cv::DMatch>("DMatchVector");
     register_vector<std::vector<char>>("CharVectorVector");
