@@ -10,9 +10,8 @@ namespace opencv_test
 {
 using namespace perf;
 
-// The threshold decides which of the two paths runs. Above every cost nothing is forbidden and
-// the dummy columns are skipped, so the solver sees an n-column matrix. Inside the cost range it
-// forbids pairs, and the padded n + rows matrix is used instead.
+// The threshold picks the path: above every cost the dummy columns are skipped, inside the cost
+// range the padded matrix is used.
 typedef TestBaseWithParam< tuple<Size, double> > Size_Threshold_LinearAssignment;
 
 PERF_TEST_P_(Size_Threshold_LinearAssignment, solve)
