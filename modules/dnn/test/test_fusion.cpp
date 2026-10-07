@@ -607,6 +607,54 @@ TEST(Fusion, SharedProjectionsCollapseToOneGemm)
     EXPECT_EQ(fusedCount(net, "Slice2"), 3);
 }
 
+// A per-channel constant Mul / Add after a constant-weight MatMul (ViT LayerScale)
+// is folded into the Gemm weights and bias, so the Gemm runs it at no extra cost.
+TEST(Fusion, ChannelAffineFoldsIntoGemmWeights)
+{
+    const std::string name = "matmul_channel_affine";
+    Net net = readNetFromONNX(findDataFile("dnn/onnx/models/" + name + ".onnx"), ENGINE_OPENCV);
+    ASSERT_TRUE(net.getMainGraph());
+
+    net.setInput(blobFromNPY(findDataFile("dnn/onnx/data/input_" + name + ".npy")));
+    Mat out = net.forward();
+    normAssert(blobFromNPY(findDataFile("dnn/onnx/data/output_" + name + ".npy")), out, name.c_str());
+
+    EXPECT_EQ(1, fusedCount(net, "NaryEltwise")) << "only the residual Add should remain";
+    Mat B;
+    for (const Ptr<LayerInfo>& l : net.getMainGraph()->prog())
+        if (l && l->type == "Gemm" && !l->blobs.empty())
+            B = l->blobs[0];
+    ASSERT_EQ(2, B.dims);
+
+    // Every row of the model's W is constant, so unfolded weights would have equal
+    // columns. Folded, column n is scaled by gamma[n]: the column ratios differ from 1
+    // and are the same in every row.
+    bool rescaled = false;
+    for (int n = 1; n < B.cols; n++) {
+        const float r0 = B.at<float>(0, n) / B.at<float>(0, 0);
+        rescaled |= std::abs(r0 - 1.f) > 1e-3f;
+        for (int k = 1; k < B.rows; k++)
+            EXPECT_NEAR(r0, B.at<float>(k, n) / B.at<float>(k, 0), 1e-5f * std::abs(r0))
+                << "k=" << k << " n=" << n;
+    }
+    EXPECT_TRUE(rescaled) << "the per-channel Mul was not folded into the weights";
+}
+
+// Here the MatMul result is also a graph output, so the Mul has to stay a separate step.
+TEST(Fusion, ChannelAffineKeepsSharedMatMulOutput)
+{
+    const std::string name = "matmul_channel_affine_shared";
+    Net net = readNetFromONNX(findDataFile("dnn/onnx/models/" + name + ".onnx"), ENGINE_OPENCV);
+    ASSERT_TRUE(net.getMainGraph());
+
+    net.setInput(blobFromNPY(findDataFile("dnn/onnx/data/input_" + name + ".npy")));
+    std::vector<Mat> outs;
+    net.forward(outs, std::vector<String>{"proj", "Y"});
+    ASSERT_EQ(2u, outs.size());
+    normAssert(blobFromNPY(findDataFile("dnn/onnx/data/output_" + name + "_0.npy")), outs[0], "proj");
+    normAssert(blobFromNPY(findDataFile("dnn/onnx/data/output_" + name + "_1.npy")), outs[1], "Y");
+}
+
 static void checkBatchNormFoldsIntoConv(const std::string& name)
 {
     Net net = readNetFromONNX(findDataFile("dnn/onnx/models/" + name + ".onnx"), ENGINE_OPENCV);
