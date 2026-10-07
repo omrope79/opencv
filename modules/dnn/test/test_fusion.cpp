@@ -655,6 +655,22 @@ TEST(Fusion, SmallInputChannelConvKeepsPlainLayout)
     EXPECT_EQ(0, fusedCount(net, "TransformLayout"));
 }
 
+// A channel Split of a convolution output keeps block layout, so the Split -> Conv / Add ->
+// Concat chain (YOLO C3k2) runs without converting back and forth. The only conversion left
+// is the network input going into the first convolution.
+TEST(Fusion, SplitKeepsBlockLayout)
+{
+    const std::string name = "split_block_channels_aligned";
+    Net net = readNetFromONNX(findDataFile("dnn/onnx/models/" + name + ".onnx"), ENGINE_OPENCV);
+    ASSERT_TRUE(net.getMainGraph());
+
+    net.setInput(blobFromNPY(findDataFile("dnn/onnx/data/input_" + name + ".npy")));
+    Mat out = net.forward();
+    normAssert(blobFromNPY(findDataFile("dnn/onnx/data/output_" + name + ".npy")), out, name.c_str());
+
+    EXPECT_EQ(1, fusedCount(net, "TransformLayout"));
+}
+
 // Here the MatMul result is also a graph output, so the Mul has to stay a separate step.
 TEST(Fusion, ChannelAffineKeepsSharedMatMulOutput)
 {

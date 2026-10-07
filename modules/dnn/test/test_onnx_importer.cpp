@@ -308,6 +308,14 @@ TEST_P(Test_ONNX_layers, Convolution_3x3_strided_and_narrow)
     testONNXModels("conv3x3_s1_c8");
 }
 
+// Split of a convolution output, which stays in block layout.
+TEST_P(Test_ONNX_layers, Split_block_layout)
+{
+    testONNXModels("split_block_channels_aligned");
+    testONNXModels("split_block_channels_unaligned");
+    testONNXModels("split_block_height");
+}
+
 TEST_P(Test_ONNX_layers, Convolution_variable_weight)
 {
     if ((backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH ||

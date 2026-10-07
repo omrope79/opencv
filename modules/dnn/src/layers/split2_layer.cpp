@@ -41,6 +41,17 @@ public:
         return backendId == DNN_BACKEND_OPENCV;
     }
 
+    // A channel split of a block-layout tensor counts logical channels, not C0 blocks.
+    static bool isBlockChannelSplit(const MatShape& inpShape, int axis_)
+    {
+        return inpShape.layout == DATA_LAYOUT_BLOCK && axis_ == 1;
+    }
+
+    static int axisSize(const MatShape& inpShape, int axis_)
+    {
+        return isBlockChannelSplit(inpShape, axis_) ? inpShape.C : inpShape[axis_];
+    }
+
     void getOutShapes(const MatShape& inpShape, int axis_,
                       const std::vector<int>& split,
                       std::vector<MatShape>& outShapes) const
@@ -50,6 +61,8 @@ public:
 
         int inpDims = inpShape.dims;
         CV_Assert(0 <= axis_ && axis_ < inpDims);
+        const bool blockC = isBlockChannelSplit(inpShape, axis_);
+        const int C0 = blockC ? inpShape.back() : 1;
         int totalSize_a = 0;
 
         outShapes.resize(noutputs);
@@ -57,11 +70,35 @@ public:
             MatShape outShape = inpShape;
             int s = split[i];
             CV_Assert(s >= 0);
-            CV_Assert(s <= inpShape[axis_] - totalSize_a);
-            outShape[axis_] = s;
+            CV_Assert(s <= axisSize(inpShape, axis_) - totalSize_a);
+            if (blockC) {
+                outShape[axis_] = (s + C0 - 1) / C0;
+                outShape.C = s;
+            } else {
+                outShape[axis_] = s;
+            }
             outShapes[i] = outShape;
             totalSize_a += s;
         }
+    }
+
+    int getLayouts(const std::vector<DataLayout>& actualInputs,
+                   std::vector<DataLayout>& desiredInputs,
+                   const int requiredOutputs,
+                   std::vector<DataLayout>& outputs) const CV_OVERRIDE
+    {
+        auto* netimpl_ = getNetImpl(this);
+        desiredInputs.assign(actualInputs.size(), DATA_LAYOUT_UNKNOWN);
+        // Block layout stays for a split along a non-negative axis; negative axes count from
+        // the end, which differs between the original and the block layout. A channel split
+        // that does not start every output on a C0 boundary is repacked inside forward().
+        if (!actualInputs.empty() && actualInputs[0] == DATA_LAYOUT_BLOCK && axis >= 0) {
+            desiredInputs[0] = DATA_LAYOUT_BLOCK;
+            outputs.assign(requiredOutputs, DATA_LAYOUT_BLOCK);
+            return netimpl_->defaultC0;
+        }
+        outputs.assign(requiredOutputs, DATA_LAYOUT_UNKNOWN);
+        return 0;
     }
 
     void makeDefaultSplit(int totalSize, size_t noutputs, std::vector<int>& split_) const
@@ -99,7 +136,7 @@ public:
             split_ = &tempSplit;
         }
         else if (split.empty()) {
-            makeDefaultSplit(inpShape[axis_], noutputs, tempSplit);
+            makeDefaultSplit(axisSize(inpShape, axis_), noutputs, tempSplit);
             split_ = &tempSplit;
         }
 
@@ -152,7 +189,7 @@ public:
             split_ = &tempSplit;
         }
         else if (split.empty()) {
-            makeDefaultSplit(inpShape[axis_], noutputs, tempSplit);
+            makeDefaultSplit(axisSize(inpShape, axis_), noutputs, tempSplit);
             split_ = &tempSplit;
         }
         getOutShapes(inpShape, axis_, *split_, outShapes);
@@ -195,10 +232,64 @@ public:
 
     void runOp(const Mat& inp, std::vector<Mat>& outs, int axis_)
     {
+        if (isBlockChannelSplit(inp.size, axis_)) {
+            runOpBlockChannels(inp, outs);
+            return;
+        }
         std::vector<int> sizes(outs.size());
         for (size_t i = 0; i < outs.size(); i++)
             sizes[i] = outs[i].size[axis_];
         splitND(inp, axis_, sizes, outs);
+    }
+
+    // Channel split of a block-layout tensor. When every output starts on a C0 boundary,
+    // each output is one contiguous run of channel blocks per image; otherwise repack
+    // through the original layout.
+    void runOpBlockChannels(const Mat& inp, std::vector<Mat>& outs)
+    {
+        const int C0 = inp.size[inp.dims - 1];
+        const size_t nout = outs.size();
+        bool aligned = true;
+        for (size_t k = 0; k + 1 < nout; k++)
+            aligned = aligned && (outs[k].size.C % C0) == 0;
+        if (!aligned) {
+            DataLayout origLayout = getNetImpl(this)->originalLayout;
+            Mat plainInp;
+            transformLayout(inp, plainInp, origLayout, origLayout, C0);
+            std::vector<int> sizes(nout);
+            for (size_t k = 0; k < nout; k++)
+                sizes[k] = outs[k].size.C;
+            std::vector<Mat> plainOuts;
+            splitND(plainInp, 1, sizes, plainOuts);
+            for (size_t k = 0; k < nout; k++)
+                transformLayout(plainOuts[k], outs[k], DATA_LAYOUT_BLOCK, origLayout, C0);
+            return;
+        }
+
+        CV_Assert(inp.isContinuous());
+        const int N = inp.size[0], C1 = inp.size[1];
+        const size_t blockBytes = inp.total() / ((size_t)N * C1) * inp.elemSize();
+        struct Piece { uchar* dst; const uchar* src; size_t len; };
+        std::vector<Piece> pieces;
+        constexpr size_t PIECE = 1 << 16;
+        int c1ofs = 0;
+        for (size_t k = 0; k < nout; k++) {
+            CV_Assert(outs[k].isContinuous());
+            const int C1k = outs[k].size[1];
+            CV_Assert(c1ofs + C1k <= C1);
+            const size_t len = C1k * blockBytes;
+            for (int n = 0; n < N; n++) {
+                const uchar* src = inp.data + ((size_t)n * C1 + c1ofs) * blockBytes;
+                uchar* dst = outs[k].data + (size_t)n * len;
+                for (size_t ofs = 0; ofs < len; ofs += PIECE)
+                    pieces.push_back({dst + ofs, src + ofs, std::min(PIECE, len - ofs)});
+            }
+            c1ofs += C1k;
+        }
+        parallel_for_(Range(0, (int)pieces.size()), [&](const Range& r) {
+            for (int i = r.start; i < r.end; i++)
+                std::memcpy(pieces[i].dst, pieces[i].src, pieces[i].len);
+        });
     }
 };
 
