@@ -190,8 +190,41 @@ public:
                 runOpBlockAxis1Misaligned(inps, out);
                 return;
             }
+            runOpBlockAxis1Aligned(inps, out);
+            return;
         }
         concatND(inps, axis_, out);
+    }
+
+    // Axis=1 BLOCK concat with C0-aligned inputs: per image, every input is one contiguous run
+    // of channel blocks in the output. Copied in fixed-size pieces so that small tensors are
+    // spread over all threads too.
+    void runOpBlockAxis1Aligned(const std::vector<Mat>& inps, Mat& out)
+    {
+        CV_Assert(out.isContinuous());
+        const int N = out.size[0], C1 = out.size[1];
+        const size_t blockBytes = out.total() / ((size_t)N * C1) * out.elemSize();
+        struct Piece { uchar* dst; const uchar* src; size_t len; };
+        std::vector<Piece> pieces;
+        constexpr size_t PIECE = 1 << 16;
+        int c1ofs = 0;
+        for (const Mat& inp : inps) {
+            CV_Assert(inp.isContinuous());
+            const int C1k = inp.size[1];
+            CV_Assert(c1ofs + C1k <= C1);
+            const size_t len = C1k * blockBytes;
+            for (int n = 0; n < N; n++) {
+                const uchar* src = inp.data + (size_t)n * len;
+                uchar* dst = out.data + ((size_t)n * C1 + c1ofs) * blockBytes;
+                for (size_t ofs = 0; ofs < len; ofs += PIECE)
+                    pieces.push_back({dst + ofs, src + ofs, std::min(PIECE, len - ofs)});
+            }
+            c1ofs += C1k;
+        }
+        parallel_for_(Range(0, (int)pieces.size()), [&](const Range& r) {
+            for (int i = r.start; i < r.end; i++)
+                std::memcpy(pieces[i].dst, pieces[i].src, pieces[i].len);
+        });
     }
 
     // Fallback for axis=1 BLOCK concat when inputs aren't C0-aligned.
