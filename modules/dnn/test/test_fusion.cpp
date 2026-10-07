@@ -640,6 +640,21 @@ TEST(Fusion, ChannelAffineFoldsIntoGemmWeights)
     EXPECT_TRUE(rescaled) << "the per-channel Mul was not folded into the weights";
 }
 
+// A 3-channel patch embedding followed by a reshape to tokens stays in plain layout:
+// no block layout conversion before or after the convolution.
+TEST(Fusion, SmallInputChannelConvKeepsPlainLayout)
+{
+    const std::string name = "conv_small_cin_patchify";
+    Net net = readNetFromONNX(findDataFile("dnn/onnx/models/" + name + ".onnx"), ENGINE_OPENCV);
+    ASSERT_TRUE(net.getMainGraph());
+
+    net.setInput(blobFromNPY(findDataFile("dnn/onnx/data/input_" + name + ".npy")));
+    Mat out = net.forward();
+    normAssert(blobFromNPY(findDataFile("dnn/onnx/data/output_" + name + ".npy")), out, name.c_str());
+
+    EXPECT_EQ(0, fusedCount(net, "TransformLayout"));
+}
+
 // Here the MatMul result is also a graph output, so the Mul has to stay a separate step.
 TEST(Fusion, ChannelAffineKeepsSharedMatMulOutput)
 {

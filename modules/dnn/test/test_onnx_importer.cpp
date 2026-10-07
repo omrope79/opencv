@@ -282,6 +282,15 @@ TEST_P(Test_ONNX_layers, Convolution)
     testONNXModels("conv_asymmetric_pads");
 }
 
+// Convolutions with at most 4 input channels run on the plain NCHW tensor, not block layout.
+TEST_P(Test_ONNX_layers, Convolution_small_input_channels)
+{
+    testONNXModels("conv_small_cin_stem");
+    testONNXModels("conv_small_cin_patchify");
+    testONNXModels("conv_small_cin_dilated");
+    testONNXModels("conv_small_cin_asym");
+}
+
 TEST_P(Test_ONNX_layers, Convolution_variable_weight)
 {
     if ((backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH ||
