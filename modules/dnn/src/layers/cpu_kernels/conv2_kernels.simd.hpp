@@ -2128,6 +2128,9 @@ static void conv32fC8(const void* inp__, const void* residual__, void* out__,
 {
 #if !CV_SIMD_SCALABLE  // RVV: skip the C0=8-specialized kernels; use the generic runtime-C0 path
     int ksize = cs.wshape[2];
+    // ksize counts kernel taps, so a 1x9, a 9x1 or a 1D 9-tap kernel has ksize == 9 too,
+    // while the 3x3 kernels below hard-code the 3x3 tap offsets.
+    const bool is3x3 = cs.kshape[0] == 1 && cs.kshape[1] == 3 && cs.kshape[2] == 3;
     if (ksize == 1 && cs.strides[0]*cs.strides[1]*cs.strides[2] == 1 && !cs.hasPadding()) {
     #if CV_SIMD256 && defined(__AVX2__)
         // Pair-Kblk fast path: 6×16 AVX2 microkernel for wide-C 1x1 stride=1.
@@ -2148,7 +2151,7 @@ static void conv32fC8(const void* inp__, const void* residual__, void* out__,
         cs.outshape.dims <= 5) {
         return conv32fC8_1x1_strided(inp__, residual__, out__, cs, weights__, scale__, bias__);
     }
-    if (ksize == 9 && cs.strides[1] == 1 && cs.strides[2] == 1 &&
+    if (is3x3 && cs.strides[1] == 1 && cs.strides[2] == 1 &&
         cs.dilations[1] == 1 && cs.dilations[2] == 1 &&
         cs.outshape.dims <= 5) {
     #if CV_SIMD256 && defined(__AVX2__)
@@ -2162,7 +2165,7 @@ static void conv32fC8(const void* inp__, const void* residual__, void* out__,
     #endif
         return conv32fC8_3x3s1(inp__, residual__, out__, cs, weights__, scale__, bias__);
     }
-    if (ksize == 9 && cs.strides[0] == 1 &&
+    if (is3x3 && cs.strides[0] == 1 &&
         cs.dilations[1] == 1 && cs.dilations[2] == 1 &&
         cs.outshape.dims <= 5) {
         return conv32fC8_3x3_strided(inp__, residual__, out__, cs, weights__, scale__, bias__);

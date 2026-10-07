@@ -291,6 +291,14 @@ TEST_P(Test_ONNX_layers, Convolution_small_input_channels)
     testONNXModels("conv_small_cin_asym");
 }
 
+// Kernels with 9 taps that are not 3x3 must not take the 3x3-specialized paths.
+TEST_P(Test_ONNX_layers, Convolution_9tap_not_3x3)
+{
+    testONNXModels("conv_kernel_1x9");
+    testONNXModels("conv_kernel_9x1");
+    testONNXModels("conv1d_kernel_9");
+}
+
 TEST_P(Test_ONNX_layers, Convolution_variable_weight)
 {
     if ((backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH ||
