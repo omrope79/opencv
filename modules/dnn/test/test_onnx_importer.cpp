@@ -299,6 +299,15 @@ TEST_P(Test_ONNX_layers, Convolution_9tap_not_3x3)
     testONNXModels("conv1d_kernel_9");
 }
 
+// 3x3 convolutions with strides other than 1 and with narrow inputs.
+TEST_P(Test_ONNX_layers, Convolution_3x3_strided_and_narrow)
+{
+    testONNXModels("conv3x3_s2_c64");
+    testONNXModels("conv3x3_s21_asym");
+    testONNXModels("conv3x3_s2_c16");
+    testONNXModels("conv3x3_s1_c8");
+}
+
 TEST_P(Test_ONNX_layers, Convolution_variable_weight)
 {
     if ((backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH ||

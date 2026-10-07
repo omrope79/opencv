@@ -1335,11 +1335,11 @@ static void conv32fC8_3x3s1(const void* inp__, const void* residual__, void* out
 }
 
 #if CV_SIMD256 && defined(__AVX2__)
-// 3x3 stride-1 conv, same 6x16 AVX2 / 2-Kblk shape as conv32fC8_1x1_kpair.
-// Dispatcher requires ksize=9, strides=1, dilations=1, Kblk even, K%K0==0, ngroups==1.
-static void conv32fC8_3x3s1_kpair(const void* inp__, const void* residual__, void* out__,
-                                  const ConvState& cs, const void* weights__,
-                                  const float* scale__, const float* bias__)
+// 3x3 conv with any stride, same 6x16 AVX2 / 2-Kblk shape as conv32fC8_1x1_kpair.
+// Dispatcher requires a 3x3 kernel, dilations=1, Kblk even, K%K0==0, ngroups==1.
+static void conv32fC8_3x3_kpair(const void* inp__, const void* residual__, void* out__,
+                                const ConvState& cs, const void* weights__,
+                                const float* scale__, const float* bias__)
 {
     const MatShape& inpshape = cs.inpshape;
     const MatShape& outshape = cs.outshape;
@@ -1379,6 +1379,7 @@ static void conv32fC8_3x3s1_kpair(const void* inp__, const void* residual__, voi
         const int Hi = ndims_ >= 5 ? inpshape[ndims_-3] : 1;
         const int Wi = inpshape[ndims_-2];
         const int padY = cs.pads[1], padX = cs.pads[2];
+        const int SY = cs.strides[1], SX = cs.strides[2];
         int planeblocks = planeblocks_;
         int planesize = planeblocks*K0;
         int iplanesize = Hi*Wi*C0;
@@ -1456,8 +1457,8 @@ static void conv32fC8_3x3s1_kpair(const void* inp__, const void* residual__, voi
 
                 int yj = p / W;
                 int xj = p - yj * W;
-                int yi_base = yj - padY;
-                int xi_base = xj - padX;
+                int yi_base = yj*SY - padY;
+                int xi_base = xj*SX - padX;
                 bool same_row = (xj + SPAT_BLOCK_SIZE <= W);
                 bool y_inner = (yj >= innerY0 && yj < innerY1);
                 bool all_inner = same_row && y_inner && (xj >= innerX0) &&
@@ -1495,7 +1496,7 @@ static void conv32fC8_3x3s1_kpair(const void* inp__, const void* residual__, voi
                     const float* inp_yx_base = inpbaseptr + (yi_base * Wi + xi_base) * C0;
                     const float* inp_pos[SPAT_BLOCK_SIZE];
                     for (int j = 0; j < SPAT_BLOCK_SIZE; j++)
-                        inp_pos[j] = inp_yx_base + j * C0;
+                        inp_pos[j] = inp_yx_base + j * SX * C0;
 
                     #define GET_BASE_INNER(j, kpos, c1) (inp_pos[j] + inp_ofs[kpos] + (c1) * iplanesize)
                     KPAIR3_FMA_BODY(GET_BASE_INNER);
@@ -1506,8 +1507,8 @@ static void conv32fC8_3x3s1_kpair(const void* inp__, const void* residual__, voi
 
                     if (same_row) {
                         for (int j = 0; j < SPAT_BLOCK_SIZE; j++) {
-                            yi_arr[j] = yj - padY;
-                            xi_arr[j] = xj + j - padX;
+                            yi_arr[j] = yj*SY - padY;
+                            xi_arr[j] = (xj + j)*SX - padX;
                             inner_arr[j] = y_inner && ((xj + j) >= innerX0 && (xj + j) < innerX1);
                         }
                     } else {
@@ -1515,8 +1516,8 @@ static void conv32fC8_3x3s1_kpair(const void* inp__, const void* residual__, voi
                             int pj = p + j;
                             int yj_ = pj / W;
                             int xj_ = pj - yj_ * W;
-                            yi_arr[j] = yj_ - padY;
-                            xi_arr[j] = xj_ - padX;
+                            yi_arr[j] = yj_*SY - padY;
+                            xi_arr[j] = xj_*SX - padX;
                             inner_arr[j] = (yj_ >= innerY0 && yj_ < innerY1) &&
                                            (xj_ >= innerX0 && xj_ < innerX1);
                         }
@@ -1582,8 +1583,8 @@ static void conv32fC8_3x3s1_kpair(const void* inp__, const void* residual__, voi
             {
                 int yj = p / W;
                 int xj = p - yj * W;
-                int yi_s = yj - padY;
-                int xi_s = xj - padX;
+                int yi_s = yj*SY - padY;
+                int xi_s = xj*SX - padX;
 
                 __m256 sa = _mm256_setzero_ps();
                 __m256 sb = _mm256_setzero_ps();
@@ -2151,23 +2152,19 @@ static void conv32fC8(const void* inp__, const void* residual__, void* out__,
         cs.outshape.dims <= 5) {
         return conv32fC8_1x1_strided(inp__, residual__, out__, cs, weights__, scale__, bias__);
     }
-    if (is3x3 && cs.strides[1] == 1 && cs.strides[2] == 1 &&
-        cs.dilations[1] == 1 && cs.dilations[2] == 1 &&
-        cs.outshape.dims <= 5) {
-    #if CV_SIMD256 && defined(__AVX2__)
-        int Kblk = cs.wshape[1];
-        int Cg = cs.inpshape.channels() / cs.ngroups;
-        int cblocks = (Cg + 7) / 8;
-        int K_ = cs.outshape.channels();
-        if ((Kblk & 1) == 0 && (K_ % 8) == 0 && cblocks >= 8 && cs.ngroups == 1) {
-            return conv32fC8_3x3s1_kpair(inp__, residual__, out__, cs, weights__, scale__, bias__);
-        }
-    #endif
-        return conv32fC8_3x3s1(inp__, residual__, out__, cs, weights__, scale__, bias__);
-    }
     if (is3x3 && cs.strides[0] == 1 &&
         cs.dilations[1] == 1 && cs.dilations[2] == 1 &&
         cs.outshape.dims <= 5) {
+    #if CV_SIMD256 && defined(__AVX2__)
+        // Also wins for narrow inputs (a single C0 block), measured on YOLO26n's 3x3 layers.
+        int Kblk = cs.wshape[1];
+        int K_ = cs.outshape.channels();
+        if ((Kblk & 1) == 0 && (K_ % 8) == 0 && cs.ngroups == 1) {
+            return conv32fC8_3x3_kpair(inp__, residual__, out__, cs, weights__, scale__, bias__);
+        }
+    #endif
+        if (cs.strides[1] == 1 && cs.strides[2] == 1)
+            return conv32fC8_3x3s1(inp__, residual__, out__, cs, weights__, scale__, bias__);
         return conv32fC8_3x3_strided(inp__, residual__, out__, cs, weights__, scale__, bias__);
     }
 #endif  // !CV_SIMD_SCALABLE
