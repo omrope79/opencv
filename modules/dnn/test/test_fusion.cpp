@@ -370,7 +370,7 @@ TEST(Fusion, SubclassOfElementWiseLayerIsRegistered)
     ASSERT_TRUE(ops->unfold(prelu.get(), m, side));
 }
 
-TEST(Fusion, ApplyTakesKernelPathThenInterpreterPath)
+TEST(Fusion, ApplyTakesKernelPathThenAffinePath)
 {
     LayerMath r;
     r.setKernel(cv::dnn::getActivationFunc(ACTIV_CLIP), { 0.f, 6.f });
@@ -390,19 +390,32 @@ TEST(Fusion, ApplyTakesKernelPathThenInterpreterPath)
     for (int i = 0; i < n; i++)
         EXPECT_FLOAT_EQ(want[i], y.ptr<float>()[i]) << "clip i=" << i;
 
+    // A scalar scale and shift has no kernel but is taken and run as a row loop.
     r = LayerMath();
-    r.unary(FusionEltwiseOp::SQRT, LayerMath::INPUT_VALUE);
-    PreparedFusion interp;
-    ASSERT_TRUE(interp.take(graphOf(r)));
-    EXPECT_TRUE(interp.activationFn == nullptr);
+    const int scaled = r.binary(FusionEltwiseOp::MUL, LayerMath::INPUT_VALUE, r.constant(2.f));
+    r.binary(FusionEltwiseOp::ADD, scaled, r.constant(5.f));
+    PreparedFusion affine;
+    ASSERT_TRUE(affine.take(graphOf(r)));
+    EXPECT_TRUE(affine.activationFn == nullptr);
 
-    int big = (1 << 16) + 17;
-    Mat z(1, &big, CV_32F);
-    for (int i = 0; i < big; i++)
+    int sz[] = { 257, 384 };
+    Mat z(2, sz, CV_32F);
+    const int total = (int)z.total();
+    for (int i = 0; i < total; i++)
         z.ptr<float>()[i] = (float)(i % 100);
-    interp.run(z);
-    for (int i = 0; i < big; i += 997)
-        EXPECT_NEAR(std::sqrt((float)(i % 100)), z.ptr<float>()[i], 1e-5) << "sqrt i=" << i;
+    affine.run(z);
+    for (int i = 0; i < total; i += 997)
+        EXPECT_FLOAT_EQ(2.f * (float)(i % 100) + 5.f, z.ptr<float>()[i]) << "affine i=" << i;
+}
+
+TEST(Fusion, ExpressionWithoutKernelOrAffineFormIsRefused)
+{
+    // Evaluating it one value at a time would be slower than keeping it as its own layer.
+    LayerMath r;
+    r.unary(FusionEltwiseOp::SQRT, LayerMath::INPUT_VALUE);
+    PreparedFusion f;
+    EXPECT_FALSE(f.take(graphOf(r)));
+    EXPECT_FALSE(f.expr);
 }
 
 TEST(Fusion, PerChannelConstIndexesTheLastAxis)
@@ -523,6 +536,86 @@ TEST(Fusion, SharedRootKeepsEachChainsOwnBuffers)
     }
 }
 
+TEST(Fusion, AffineWithScaleAndShiftBuffers)
+{
+    AdjacencyGraphBuilder arena;
+    const int in = arena.internNode(FusionEltwiseOp::INPUT, {});
+    LayerMath r;
+    const int shift = r.perChannelConstant(1);  // created first, so it lands on the left of the ADD
+    const int scaled = r.binary(FusionEltwiseOp::MUL, LayerMath::INPUT_VALUE, r.perChannelConstant(0));
+    r.binary(FusionEltwiseOp::ADD, shift, scaled);
+    const int root = fusion::instantiate(arena, in, r);
+    ASSERT_GE(root, 0);
+
+    // 37 is not a multiple of any SIMD width, so every row also runs the scalar tail.
+    const int nch = 37, rows = 5;
+    Mat s(1, &nch, CV_32F), b(1, &nch, CV_32F);
+    for (int c = 0; c < nch; c++) { s.ptr<float>()[c] = 0.5f + c; b.ptr<float>()[c] = c - 3.f; }
+    Ptr<AdjacencyGraph> expr = fusion::extract(arena.graph(), root, std::vector<Mat>{ s, b });
+    ASSERT_TRUE(expr);
+    PreparedFusion f;
+    ASSERT_TRUE(f.take(expr));
+
+    int sz[] = { rows, nch };
+    Mat y(2, sz, CV_32F);
+    for (int i = 0; i < rows * nch; i++)
+        y.ptr<float>()[i] = 0.25f * i;
+    f.run(y);
+    for (int i = 0; i < rows * nch; i++) {
+        const int c = i % nch;
+        EXPECT_NEAR(0.25f * i * (0.5f + c) + (c - 3.f), y.ptr<float>()[i], 1e-3) << "i=" << i;
+    }
+}
+
+TEST(Fusion, AffineFoldsSubAndShiftBeforeScale)
+{
+    // (x + b[c]) * s[c] folds to x * s[c] + b[c] * s[c].
+    AdjacencyGraphBuilder arena;
+    const int in = arena.internNode(FusionEltwiseOp::INPUT, {});
+    LayerMath r;
+    const int shifted = r.binary(FusionEltwiseOp::ADD, LayerMath::INPUT_VALUE, r.perChannelConstant(1));
+    r.binary(FusionEltwiseOp::MUL, shifted, r.perChannelConstant(0));
+    const int root = fusion::instantiate(arena, in, r);
+    ASSERT_GE(root, 0);
+
+    const int nch = 37, rows = 3;
+    Mat s(1, &nch, CV_32F), b(1, &nch, CV_32F);
+    for (int c = 0; c < nch; c++) { s.ptr<float>()[c] = 1.f + 0.1f * c; b.ptr<float>()[c] = 2.f - c; }
+    Ptr<AdjacencyGraph> expr = fusion::extract(arena.graph(), root, std::vector<Mat>{ s, b });
+    ASSERT_TRUE(expr);
+    PreparedFusion f;
+    ASSERT_TRUE(f.take(expr));
+
+    int sz[] = { rows, nch };
+    Mat y(2, sz, CV_32F);
+    for (int i = 0; i < rows * nch; i++)
+        y.ptr<float>()[i] = (float)(i % 11);
+    f.run(y);
+    for (int i = 0; i < rows * nch; i++) {
+        const int c = i % nch;
+        EXPECT_NEAR(((float)(i % 11) + (2.f - c)) * (1.f + 0.1f * c), y.ptr<float>()[i], 1e-3) << "i=" << i;
+    }
+
+    // (x - 3) * 0.5 with scalars is taken; c - x is not affine in this form and is refused.
+    LayerMath sub;
+    const int minus = sub.binary(FusionEltwiseOp::SUB, LayerMath::INPUT_VALUE, sub.constant(3.f));
+    sub.binary(FusionEltwiseOp::MUL, minus, sub.constant(0.5f));
+    PreparedFusion fs;
+    ASSERT_TRUE(fs.take(graphOf(sub)));
+    int n = 19;
+    Mat z(1, &n, CV_32F);
+    for (int i = 0; i < n; i++)
+        z.ptr<float>()[i] = (float)i;
+    fs.run(z);
+    for (int i = 0; i < n; i++)
+        EXPECT_FLOAT_EQ((i - 3.f) * 0.5f, z.ptr<float>()[i]) << "sub i=" << i;
+
+    LayerMath rev;
+    rev.binary(FusionEltwiseOp::SUB, rev.constant(3.f), LayerMath::INPUT_VALUE);
+    PreparedFusion fr;
+    EXPECT_FALSE(fr.take(graphOf(rev)));
+}
+
 TEST(Fusion, ShapeOfStaticInputFoldsToConstant)
 {
     Net net = readNetFromONNX(findDataFile("dnn/onnx/models/dynamic_reshape.onnx"));
@@ -640,6 +733,12 @@ TEST(Fusion, BatchNormFoldsIntoPrepacked1x1Conv)
     checkBatchNormFoldsIntoConv("batchnorm_conv_1x1_mlas");
 }
 
+// A 4x4 patch embedding with 3 input channels: the conv runs on the plain input with its own weight copy.
+TEST(Fusion, BatchNormFoldsIntoSmallCinConv)
+{
+    checkBatchNormFoldsIntoConv("batchnorm_conv_small_cin");
+}
+
 // ConvTranspose2d(8->16) -> Add(residual): the Add fuses into TransformLayout.
 TEST(Fusion, TransformLayoutAddFusedMatchesUnfusedComputation)
 {
@@ -731,6 +830,229 @@ TEST(Fusion, TransformLayoutAddBroadcastResidualMatchesUnfused)
     cv::add(deconvOut, residualFull, unfusedOut);
 
     normAssert(unfusedOut, fusedOut, "fused vs unfused, broadcast residual", 1e-5, 1e-5);
+}
+
+// Same values as formula_weights() in opencv_extra's generate_onnx_models.py.
+static Mat formulaWeights(const std::vector<int>& shape, int salt = 1)
+{
+    Mat m(shape, CV_32F);
+    float* p = m.ptr<float>();
+    for (size_t i = 0; i < m.total(); i++)
+        p[i] = (float)((int)((i * 37 + salt) % 61) - 30) / 256.f;
+    return m;
+}
+
+static Mat randomInput(const std::vector<int>& shape)
+{
+    Mat m(shape, CV_32F);
+    theRNG().fill(m, RNG::UNIFORM, -1.0, 1.0);
+    return m;
+}
+
+static Net loadModel(const std::string& name)
+{
+    return readNetFromONNX(_tf("models/" + name + ".onnx"), ENGINE_OPENCV);
+}
+
+// LayerScale after a MatMul folds into the Gemm weights, but not when the MatMul result is also an output.
+TEST(Fusion, LayerScaleFoldsIntoGemmWeights)
+{
+    Net net = loadModel("matmul_channel_affine");
+    Mat x = randomInput({2, 5, 16}), s = randomInput({2, 5, 16});
+    net.setInput(x, "X");
+    net.setInput(s, "S");
+    std::vector<Mat> outs;
+    net.forward(outs, std::vector<String>{"Y", "proj", "Y_shared"});
+    ASSERT_EQ(3u, outs.size());
+
+    const Mat W = formulaWeights({16, 24}), b = formulaWeights({24}, 2), beta = formulaWeights({24}, 4);
+    Mat gamma = formulaWeights({24}, 3) + 1;
+    const float *bp = b.ptr<float>(), *gp = gamma.ptr<float>(), *betap = beta.ptr<float>();
+    Mat px = x.reshape(1, 10) * W, ps = s.reshape(1, 10) * W;
+    Mat refY(10, 24, CV_32F), refProj(10, 24, CV_32F), refShared(10, 24, CV_32F);
+    for (int i = 0; i < 10; i++)
+        for (int n = 0; n < 24; n++)
+        {
+            refY.at<float>(i, n) = (px.at<float>(i, n) + bp[n]) * gp[n] + betap[n];
+            refProj.at<float>(i, n) = ps.at<float>(i, n) + bp[n];
+            refShared.at<float>(i, n) = refProj.at<float>(i, n) * gp[n];
+        }
+    const std::vector<int> shape{2, 5, 24};
+    normAssert(refY.reshape(1, shape), outs[0], "folded");
+    normAssert(refProj.reshape(1, shape), outs[1], "shared MatMul result");
+    normAssert(refShared.reshape(1, shape), outs[2], "not folded");
+
+    // One Gemm holds W with column n scaled by gamma[n], the other plain W.
+    Mat scaledW = W.clone();
+    for (int n = 0; n < 24; n++)
+    {
+        Mat col = scaledW.col(n);
+        col *= gp[n];
+    }
+    int scaled = 0, plain = 0;
+    for (const auto& l : net.getMainGraph()->prog())
+    {
+        if (!l || l->type != "Gemm" || l->blobs.empty() || l->blobs[0].total() != W.total())
+            continue;
+        Mat B = l->blobs[0].rows == W.rows ? l->blobs[0] : Mat(l->blobs[0].t());
+        scaled += cvtest::norm(B, scaledW, NORM_INF) < 1e-6;
+        plain += cvtest::norm(B, W, NORM_INF) < 1e-6;
+    }
+    EXPECT_EQ(1, scaled) << "LayerScale was not folded into the Gemm weights";
+    EXPECT_EQ(1, plain) << "the Gemm whose result is shared must keep its weights";
+}
+
+// Direct NCHW convolution without groups, accumulated in double; pads are {top, left, bottom, right}.
+static Mat refConv(const Mat& x, const Mat& w, const Mat& b, Vec2i strides, Vec4i pads,
+                   Vec2i dilations = Vec2i(1, 1))
+{
+    const int N = x.size[0], C = x.size[1], H = x.size[2], W = x.size[3];
+    const int K = w.size[0], kh = w.size[2], kw = w.size[3];
+    CV_Assert(w.size[1] == C);
+    const int OH = (H + pads[0] + pads[2] - (kh - 1) * dilations[0] - 1) / strides[0] + 1;
+    const int OW = (W + pads[1] + pads[3] - (kw - 1) * dilations[1] - 1) / strides[1] + 1;
+    Mat y(std::vector<int>{N, K, OH, OW}, CV_32F);
+    const float *xp = x.ptr<float>(), *wp = w.ptr<float>();
+    float* yp = y.ptr<float>();
+    for (int n = 0; n < N; n++)
+    for (int k = 0; k < K; k++)
+    for (int oy = 0; oy < OH; oy++)
+    for (int ox = 0; ox < OW; ox++)
+    {
+        double s = b.empty() ? 0. : b.ptr<float>()[k];
+        for (int c = 0; c < C; c++)
+        for (int ky = 0; ky < kh; ky++)
+        for (int kx = 0; kx < kw; kx++)
+        {
+            const int iy = oy * strides[0] - pads[0] + ky * dilations[0];
+            const int ix = ox * strides[1] - pads[1] + kx * dilations[1];
+            if (0 <= iy && iy < H && 0 <= ix && ix < W)
+                s += (double)xp[((n * C + c) * H + iy) * W + ix] * wp[((k * C + c) * kh + ky) * kw + kx];
+        }
+        yp[((n * K + k) * OH + oy) * OW + ox] = (float)s;
+    }
+    return y;
+}
+
+static Mat silu(const Mat& x)
+{
+    Mat y = x.clone();
+    float* p = y.ptr<float>();
+    for (size_t i = 0; i < y.total(); i++)
+        p[i] = p[i] / (1.f + std::exp(-p[i]));
+    return y;
+}
+
+static Mat relu(const Mat& x)
+{
+    Mat y = x.clone();
+    float* p = y.ptr<float>();
+    for (size_t i = 0; i < y.total(); i++)
+        p[i] = std::max(p[i], 0.f);
+    return y;
+}
+
+// A patch embedding with 3 input channels reads the plain input, so it needs no layout conversion.
+// Other small convs, like this padded 5x5 one, keep block layout and the blocked kernel.
+TEST(Fusion, OnlyPatchEmbeddingConvSkipsBlockLayout)
+{
+#ifdef HAVE_MLAS
+    Net patch = loadModel("conv_patch_embed");
+    patch.setInput(randomInput({2, 3, 17, 15}));
+    patch.forward();
+    EXPECT_EQ(0, fusedCount(patch, "TransformLayout"));
+
+    Net padded = loadModel("convolution");
+    padded.setInput(randomInput({1, 3, 10, 10}));
+    padded.forward();
+    EXPECT_LT(0, fusedCount(padded, "TransformLayout"));
+#else
+    throw SkipTestException("the plain-input patch embedding needs MLAS");
+#endif
+}
+
+// Patch embeddings with 3 input channels: 4x4 + ReLU, and 2x3 without bias; the input size
+// is not a multiple of the patch, so the last rows and columns are dropped.
+TEST(Fusion, PatchEmbeddingConvMatchesReference)
+{
+    Net net = loadModel("conv_patch_embed");
+    Mat x = randomInput({2, 3, 17, 15});
+    net.setInput(x);
+    std::vector<Mat> outs;
+    net.forward(outs, std::vector<String>{"Y_4x4", "Y_2x3"});
+    ASSERT_EQ(2u, outs.size());
+
+    normAssert(relu(refConv(x, formulaWeights({16, 3, 4, 4}, 7), formulaWeights({16}, 8),
+                            Vec2i(4, 4), Vec4i(0, 0, 0, 0))),
+               outs[0], "4x4 patch + ReLU");
+    normAssert(refConv(x, formulaWeights({8, 3, 2, 3}, 9), Mat(), Vec2i(2, 3), Vec4i(0, 0, 0, 0)),
+               outs[1], "2x3 patch");
+}
+
+// A 1x9 kernel also has 9 taps but must not take the 3x3 path; the 3x3 conv uses stride (2, 1) and (2, 2).
+TEST(Fusion, NineTapAndStrided3x3Conv)
+{
+    Net net = loadModel("conv_9tap_and_strided");
+    Mat x = randomInput({1, 16, 12, 24});
+    net.setInput(x);
+    std::vector<Mat> outs;
+    net.forward(outs, std::vector<String>{"Y_1x9", "Y_3x3", "Y_3x3_s2"});
+    ASSERT_EQ(3u, outs.size());
+
+    const Mat w = formulaWeights({32, 16, 3, 3}, 5), b = formulaWeights({32}, 6);
+    const Vec4i pads(0, 1, 1, 2);
+    normAssert(refConv(x, formulaWeights({16, 16, 1, 9}), Mat(), Vec2i(1, 1), Vec4i(0, 4, 0, 4)),
+               outs[0], "1x9 kernel");
+    normAssert(silu(refConv(x, w, b, Vec2i(2, 1), pads)), outs[1], "3x3 kernel, stride (2, 1)");
+    normAssert(refConv(x, w, b, Vec2i(2, 2), pads), outs[2], "3x3 kernel, stride (2, 2)");
+}
+
+static Mat slice(const Mat& m, int axis, int start, int end)
+{
+    std::vector<Range> r(m.dims, Range::all());
+    r[axis] = Range(start, end);
+    return m(r).clone();
+}
+
+static Mat concat(const std::vector<Mat>& parts, int axis)
+{
+    std::vector<int> shape(parts[0].size.p, parts[0].size.p + parts[0].dims);
+    shape[axis] = 0;
+    for (const Mat& p : parts)
+        shape[axis] += p.size[axis];
+    Mat out(shape, CV_32F);
+    int ofs = 0;
+    for (const Mat& p : parts)
+    {
+        std::vector<Range> r(out.dims, Range::all());
+        r[axis] = Range(ofs, ofs + p.size[axis]);
+        Mat dst = out(r);
+        p.copyTo(dst);
+        ofs += p.size[axis];
+    }
+    return out;
+}
+
+// Split of a conv output stays in block layout, aligned or not; only the network input is converted.
+TEST(Fusion, SplitKeepsBlockLayout)
+{
+    Net net = loadModel("split_block_layout");
+    Mat x = randomInput({1, 8, 10, 12});
+    net.setInput(x);
+    std::vector<Mat> outs;
+    net.forward(outs, std::vector<String>{"Y_aligned", "Y_unaligned", "Y_height", "Y_default"});
+    ASSERT_EQ(4u, outs.size());
+
+    const Vec2i s1(1, 1);
+    const Vec4i p1(1, 1, 1, 1);
+    Mat c1 = refConv(x, formulaWeights({32, 8, 3, 3}), formulaWeights({32}, 2), s1, p1);
+    Mat a = slice(c1, 1, 0, 16), b = slice(c1, 1, 16, 32);
+    Mat r = b + refConv(b, formulaWeights({16, 16, 3, 3}, 5), formulaWeights({16}, 6), s1, p1);
+    normAssert(concat({a, b, r}, 1), outs[0], "aligned split");
+    normAssert(concat({slice(c1, 1, 12, 32), slice(c1, 1, 0, 12)}, 1), outs[1], "unaligned split");
+    normAssert(concat({slice(c1, 2, 0, 5), slice(c1, 2, 5, 10)}, 3), outs[2], "split along H");
+    normAssert(concat({b, a}, 1), outs[3], "split without sizes");
+    EXPECT_EQ(1, fusedCount(net, "TransformLayout"));
 }
 
 }} // namespace opencv_test
