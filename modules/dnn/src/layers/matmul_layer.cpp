@@ -9,6 +9,7 @@
 #include <opencv2/dnn/shape_utils.hpp>
 #include "cpu_kernels/fast_gemm.hpp"
 #include "cpu_kernels/mlas_gemm.hpp"
+#include "cpu_kernels/gemm_select.hpp"
 
 // OpenVINO backend
 #include "../op_inf_engine.hpp"
@@ -238,8 +239,15 @@ class MatMulLayerImpl CV_FINAL : public MatMulLayer {
             packed_input_B.clear();
             packed_input_B.shrink_to_fit();
             thin_packed_B.clear();
+            engine_B.release();
 
-            if (helper.batch == 1 && B_mat->type() == CV_32F &&
+            if (!blobs.empty() && B_mat->type() == CV_32F && B_mat->isContinuous() &&
+                gemmUseEngine(helper.M, helper.N, helper.K, true)) {
+                // One engine pack per stored B slice; rows of B are its last dim.
+                const int ldb = B_mat->size[B_mat->dims - 1];
+                engine_B.pack(B_mat->ptr<const float>(), (size_t)ldb * sizeof(float), helper.N, helper.K, trans_b,
+                              (int)helper.B_batch, (size_t)helper.N * helper.K);
+            } else if (helper.batch == 1 && B_mat->type() == CV_32F &&
                 fastGemmThinEligible(helper.M, helper.N, helper.K)) {
                 thin_packed_B.resize(fastGemmThinPackBSize(helper.N, helper.K));
                 fastGemmThinPackB(helper.N, helper.K,
@@ -292,6 +300,61 @@ class MatMulLayerImpl CV_FINAL : public MatMulLayer {
 #endif
     }
 
+    // Y = beta * bias, broadcast to the output shape.
+    void fillBias(const std::vector<Mat>& inputs, Mat& Y)
+    {
+        auto *y = Y.ptr<float>();
+        const auto &shape_Y = shape(Y);
+        if (blobs.empty()) { // bias from input
+            const auto &bias_mat = inputs.back();
+            const auto *bias = bias_mat.ptr<const float>();
+            if (bias_mat.total() == 1) { // [], [1], [1, ...]
+                float b = (*bias) * beta;
+                for (size_t i = 0; i < Y.total(); i++) {
+                    y[i] = b;
+                }
+            } else if (real_ndims_C == 1) { // [n]
+                const size_t inner_size = shape_Y.back(),
+                             batches = total(Y) / inner_size;
+                parallel_for_(Range(0, batches), [&] (const Range &r) {
+                    for (int i = r.start; i < r.end; i++) {
+                        const size_t output_offset = i * inner_size;
+                        for (size_t j = 0; j < inner_size; j++) {
+                            y[output_offset + j] = beta * bias[j];
+                        }
+                    }
+                }, double(batches * inner_size * (1 / 1024.0)));
+            } else {
+                broadcast(bias_mat, shape_Y, Y);
+            }
+        } else { // bias from constant
+            const auto *bias = broadcast_bias.ptr<const float>();
+            std::memcpy(y, bias, total(shape_Y) * sizeof(float));
+        }
+    }
+
+    // Constant B on the core GEMM engine: one tall product when B is shared and A, C are contiguous.
+    void forwardEngine(const float* a, float* y, float gemmBeta)
+    {
+        const int M = helper.M, N = helper.N, K = helper.K;
+        const size_t batch = helper.batch, lda = (size_t)(trans_a ? M : K);
+        bool flat = engine_B.count == 1 && !trans_a && helper.ldc == N;
+        for (size_t i = 0; flat && i < batch; i++)
+            flat = helper.A_offsets[i] == i * M * K && helper.C_offsets[i] == i * M * N;
+        if (flat)
+        {
+            engine_B.gemm(0, a, (size_t)K * sizeof(float), false, y, (size_t)N * sizeof(float),
+                          (int)(batch * M), alpha, gemmBeta, true);
+            return;
+        }
+        for (size_t i = 0; i < batch; i++)
+        {
+            const int slice = engine_B.count == 1 ? 0 : (int)(helper.B_offsets[i] / ((size_t)N * K));
+            engine_B.gemm(slice, a + helper.A_offsets[i], lda * sizeof(float), trans_a, y + helper.C_offsets[i],
+                          (size_t)helper.ldc * sizeof(float), M, alpha, gemmBeta, true);
+        }
+    }
+
     // works like Y = numpy.matmul(A, B)
     void forward(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr, OutputArrayOfArrays internals_arr) CV_OVERRIDE {
         CV_TRACE_FUNCTION();
@@ -340,44 +403,25 @@ class MatMulLayerImpl CV_FINAL : public MatMulLayer {
 
         const auto *a = A.ptr<const float>();
         auto *y = Y.ptr<float>();
-        // add bias if existed
-        if ((inputs.size() + blobs.size()) >= 3) {
-            const auto &shape_Y = shape(Y);
-            if (blobs.empty()) { // bias from input
-                const auto &bias_mat = inputs.back();
-                const auto *bias = bias_mat.ptr<const float>();
-                if (bias_mat.total() == 1) { // [], [1], [1, ...]
-                    float b = (*bias) * beta;
-                    for (size_t i = 0; i < Y.total(); i++) {
-                        y[i] = b;
-                    }
-                } else if (real_ndims_C == 1) { // [n]
-                    const size_t inner_size = shape_Y.back(),
-                                 batches = total(Y) / inner_size;
-                    parallel_for_(Range(0, batches), [&] (const Range &r) {
-                        for (int i = r.start; i < r.end; i++) {
-                            const size_t output_offset = i * inner_size;
-                            for (size_t j = 0; j < inner_size; j++) {
-                                y[output_offset + j] = beta * bias[j];
-                            }
-                        }
-                    }, double(batches * inner_size * (1 / 1024.0)));
-                } else {
-                    broadcast(bias_mat, shape_Y, Y);
-                }
-            } else { // bias from constant
-                const auto *bias = broadcast_bias.ptr<const float>();
-                std::memcpy(y, bias, total(shape_Y) * sizeof(float));
-            }
-        } else {
-            std::memset(y, 0, Y.total() * sizeof(float));
+        const bool haveBias = (inputs.size() + blobs.size()) >= 3;
+        if (!blobs.empty() && !engine_B.empty()) {
+            if (haveBias)
+                fillBias(inputs, Y);
+            forwardEngine(a, y, haveBias ? beta : 0.f);
+            fusion.run(Y);
+            return;
         }
+        if (haveBias)
+            fillBias(inputs, Y);
+        else
+            std::memset(y, 0, Y.total() * sizeof(float));
 
         if (blobs.empty()) {
             const auto &B = inputs[1];
             const auto *b = B.ptr<const float>();
             bool done = false;
-            if (mlasAvailable() && !opt.use_rvv && helper.M > 0 && helper.N > 0 && helper.K > 0) {
+            if (mlasAvailable() && !opt.use_rvv && helper.M > 0 && helper.N > 0 && helper.K > 0 &&
+                !gemmUseEngine(helper.M, helper.N, helper.K, false)) {
                 const auto A_shape = shape(A);
                 const auto B_shape = shape(B);
                 const int lda_mem = A_shape.back();
@@ -751,6 +795,7 @@ class MatMulLayerImpl CV_FINAL : public MatMulLayer {
     int real_ndims_C;
 
     std::vector<float> packed_input_B;
+    EngineGemmB engine_B;  // constant B packed for the core GEMM engine (Arm)
     std::vector<float> thin_packed_B;
     Mat broadcast_bias;
 

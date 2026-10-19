@@ -7,6 +7,7 @@
 #include <opencv2/dnn/shape_utils.hpp>
 #include "layers_common.hpp"
 #include "cpu_kernels/fast_gemm.hpp"
+#include "cpu_kernels/gemm_select.hpp"
 #include "../net_impl.hpp"
 
 namespace cv
@@ -102,6 +103,8 @@ class LSTM2LayerImpl CV_FINAL : public LSTM2Layer
     std::vector<Mat> weightBlobs;   // cached transformed weights: [Wx, Wh, bias, (pI,pF,pO)]
     FastGemmOpt gemmOpt;            // MLAS GEMM options for the batched input projection
     std::vector<std::vector<float>> packedWx;  // per-direction prepacked Wx (fp32) for fastGemm
+    std::vector<EngineGemmB> engineWx;          // the same for the core GEMM engine (Arm)
+    std::vector<EngineGemmB> engineWh;          // per-direction Wh for the recurrent step (Arm)
 
     public:
         LSTM2LayerImpl(const LayerParams& params)
@@ -288,7 +291,13 @@ class LSTM2LayerImpl CV_FINAL : public LSTM2Layer
             // Batched projection: gatesAll = Wx*x + bias for the whole sequence.
             const int gateN = 4 * numHidden, projK = xTs.cols;
             Mat gatesAll;
-            if (dtype == CV_32F && (int)packedWx.size() == numDirs && !packedWx[i].empty())
+            if (dtype == CV_32F && (int)engineWx.size() == numDirs && !engineWx[i].empty())
+            {
+                repeat(bias, batchSizeTotal, 1, gatesAll);   // each row starts as the bias
+                engineWx[i].gemm(0, xTs.ptr<float>(), (size_t)projK * sizeof(float), false, gatesAll.ptr<float>(),
+                                 (size_t)gateN * sizeof(float), batchSizeTotal, 1.f, 1.f, numDirs == 1);
+            }
+            else if (dtype == CV_32F && (int)packedWx.size() == numDirs && !packedWx[i].empty())
             {
                 FastGemmOpt opt = gemmOpt;
                 opt.multi_thread = (numDirs == 1);  // directions are parallelized when bidirectional
@@ -336,6 +345,13 @@ class LSTM2LayerImpl CV_FINAL : public LSTM2Layer
                 Mat gates = gatesAll.rowRange(curRowRange);  // already holds Wx * x_t + b
 
                 // gates += Wh * h_{t-1}
+                if ((int)engineWh.size() == numDirs && !engineWh[i].empty() && dtype == CV_32F)
+                {
+                    // One engine product for all batch rows (Arm).
+                    engineWh[i].gemm(0, hInternal.ptr<float>(), hInternal.step[0], false, gates.ptr<float>(),
+                                     gates.step[0], hInternal.rows, 1.f, 1.f, numDirs == 1);
+                }
+                else
 #if CV_TRY_AVX2
                 if (useAVX2 && canUseAvxH)
                 {
@@ -672,15 +688,33 @@ class LSTM2LayerImpl CV_FINAL : public LSTM2Layer
 
             // Prepack Wx per direction (fp32) so the projection is one batched GEMM.
             packedWx.clear();
+            engineWx.clear();
+            engineWh.clear();
             if (weightBlobs[0].type() == CV_32F)
             {
                 const int numDirs = 1 + static_cast<int>(bidirectional);
                 const int N = weightBlobs[0].rows / numDirs;   // 4 * numHidden
-                packedWx.resize(numDirs);
+                const bool engine = gemmEngineEnabled();
+                if (engine)
+                    engineWx.resize(numDirs);
+                else
+                    packedWx.resize(numDirs);
                 for (int d = 0; d < numDirs; d++)
                 {
                     Mat WxDir = weightBlobs[0].rowRange(d * N, (d + 1) * N);
-                    fastGemmPackB(WxDir, packedWx[d], true, gemmOpt);
+                    if (engine)
+                        engineWx[d].pack(WxDir.ptr<const float>(), WxDir.step[0], N, WxDir.cols, true);
+                    else
+                        fastGemmPackB(WxDir, packedWx[d], true, gemmOpt);
+                }
+                if (engine && weightBlobs[1].type() == CV_32F)
+                {
+                    engineWh.resize(numDirs);
+                    for (int d = 0; d < numDirs; d++)
+                    {
+                        Mat WhDir = weightBlobs[1].rowRange(d * N, (d + 1) * N);
+                        engineWh[d].pack(WhDir.ptr<const float>(), WhDir.step[0], N, WhDir.cols, true);
+                    }
                 }
             }
 
