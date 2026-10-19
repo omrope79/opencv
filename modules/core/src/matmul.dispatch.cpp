@@ -283,8 +283,13 @@ void gemm32f(const float* src1, size_t src1_step, const float* src2, size_t src2
              int m_a, int n_a, int n_d, int flags)
 {
     CV_INSTRUMENT_REGION();
+#if CV_NEON && CV_NEON_AARCH64 && defined(HAVE_LAPACK_BUILTIN)
+    // The built-in reference LAPACK is slower than the engine, so the engine goes first.
+    if (gemm_engine::gemm32f(src1, src1_step, src2, src2_step, alpha, src3, src3_step, beta, dst, dst_step, m_a, n_a, n_d, flags))
+        return;
+#endif
     CALL_HAL(gemm32f, cv_hal_gemm32f, src1, src1_step, src2, src2_step, alpha, src3, src3_step, beta, dst, dst_step, m_a, n_a, n_d, flags)
-#if CV_NEON && CV_NEON_AARCH64
+#if CV_NEON && CV_NEON_AARCH64 && !defined(HAVE_LAPACK_BUILTIN)
     // Below the LAPACK threshold, or without LAPACK, the in-house engine takes it.
     if (gemm_engine::gemm32f(src1, src1_step, src2, src2_step, alpha, src3, src3_step, beta, dst, dst_step, m_a, n_a, n_d, flags))
         return;
