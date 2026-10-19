@@ -207,6 +207,10 @@ public:
         case OPERATION::SUM:  o = FusionEltwiseOp::ADD; break;
         case OPERATION::SUB:  o = FusionEltwiseOp::SUB; break;
         case OPERATION::PROD: o = FusionEltwiseOp::MUL; break;
+        // x / c runs as x * (1/c); only a scalar divisor has that form here.
+        case OPERATION::DIV:
+            if (!side.flowIsFirstInput) return false;
+            o = FusionEltwiseOp::MUL; break;
         case OPERATION::MAX:  o = FusionEltwiseOp::MAX; break;
         case OPERATION::MIN:  o = FusionEltwiseOp::MIN; break;
         default: return false;
@@ -218,6 +222,12 @@ public:
             if (o != FusionEltwiseOp::ADD)
                 return false;
             r.binary(o, LayerMath::INPUT_VALUE, r.tensorOperand(k.tensorId));
+            return true;
+        }
+
+        if (op == OPERATION::DIV) {
+            if (k.isBuffer()) return false;
+            r.binary(o, LayerMath::INPUT_VALUE, r.constant(1.f / k.value));
             return true;
         }
 
