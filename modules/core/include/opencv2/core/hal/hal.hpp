@@ -129,6 +129,12 @@ so a shared (broadcast) matrix simply repeats its offset.
 @param beta multiplier of C
 @param flags CV_HAL_GEMM_1_T, CV_HAL_GEMM_2_T, CV_HAL_GEMM_SINGLE_THREAD
 */
+/** @brief Returns true when the fp32 GEMM functions above run on the Arm SME units of this CPU.
+
+Callers can use it to pick between this GEMM and other libraries.
+*/
+CV_EXPORTS bool gemm32fUsesSME();
+
 CV_EXPORTS void gemm32fBatch(int batch,
                              const float* A, const size_t* A_offsets, size_t A_step,
                              const float* B, const size_t* B_offsets, size_t B_step,
