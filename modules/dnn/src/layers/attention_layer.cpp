@@ -6,6 +6,8 @@
 #include "cpu_kernels/fast_gemm.hpp"
 #include "cpu_kernels/softmax.hpp"
 #include "cpu_kernels/mlas_gemm.hpp"
+#include "cpu_kernels/gemm_select.hpp"
+#include "cpu_kernels/flash_attention.hpp"
 
 #include <opencv2/dnn/shape_utils.hpp>
 
@@ -250,6 +252,14 @@ class AttentionLayerImpl CV_FINAL : public AttentionLayer {
         qkv_head_sizes[2] = static_cast<size_t>(qkv_hidden_sizes[2] / num_heads);
 
         const auto *weight_data = weight.ptr<const float>();
+        if (gemmEngineEnabled()) {
+            // Engine packs: one slice per head, heads are column blocks of the weight.
+            const size_t offsets[3] = {0, qkv_hidden_sizes[0], qkv_hidden_sizes[0] + qkv_hidden_sizes[1]};
+            for (int q = 0; q < 3; q++)
+                engine_weight[q].pack(weight_data + offsets[q], hidden_size * sizeof(float), (int)qkv_head_sizes[q],
+                                      (int)input_hidden_size, false, (int)num_heads, qkv_head_sizes[q]);
+            return;
+        }
         packWeight(num_heads, qkv_head_sizes[0], input_hidden_size, weight_data,                                             hidden_size, packed_weight_q, opt);
         packWeight(num_heads, qkv_head_sizes[1], input_hidden_size, weight_data + qkv_hidden_sizes[0],                       hidden_size, packed_weight_k, opt);
         packWeight(num_heads, qkv_head_sizes[2], input_hidden_size, weight_data + qkv_hidden_sizes[0] + qkv_hidden_sizes[1], hidden_size, packed_weight_v, opt);
@@ -297,7 +307,7 @@ class AttentionLayerImpl CV_FINAL : public AttentionLayer {
         if (blobs.empty())
             packQKV(inputs[1]);
         // Const weight: pack once as fallback when prepackWeights() wasn't called.
-        else if (packed_weight_q.empty())
+        else if (packed_weight_q.empty() && engine_weight[0].empty())
             packQKV(blobs.front());
 
         float *packed_weights[3] = {packed_weight_q.data(), packed_weight_k.data(), packed_weight_v.data()};
@@ -349,11 +359,17 @@ class AttentionLayerImpl CV_FINAL : public AttentionLayer {
                         dst_data += head_size;
                     }
 
-                    auto *packed_weight = packed_weights[qkv_index] + packed_weights_size[qkv_index] * head_index;
                     // Single-threaded gemm; outer parallel_for_ already partitions over (batch, head, qkv).
-                    fastGemm(false, seq_len, head_size, input_hidden_size,
-                            1.f, input_data + input_offset, input_hidden_size,
-                            packed_weight, 1.f, dst + dst_offset, head_size, opt);
+                    if (!engine_weight[qkv_index].empty()) {
+                        engine_weight[qkv_index].gemm(head_index, input_data + input_offset,
+                                                      input_hidden_size * sizeof(float), false, dst + dst_offset,
+                                                      head_size * sizeof(float), (int)seq_len, 1.f, 1.f, false);
+                    } else {
+                        auto *packed_weight = packed_weights[qkv_index] + packed_weights_size[qkv_index] * head_index;
+                        fastGemm(false, seq_len, head_size, input_hidden_size,
+                                1.f, input_data + input_offset, input_hidden_size,
+                                packed_weight, 1.f, dst + dst_offset, head_size, opt);
+                    }
 
                     if(qkv_index < 2 && do_rotary) {
                         // Apply RoPE to Q/K in place (V is left untouched).
@@ -377,7 +393,7 @@ class AttentionLayerImpl CV_FINAL : public AttentionLayer {
         const bool has_mask = (!blobs.empty() && num_non_blob_inputs >= 2) ||
                                 ( blobs.empty() && num_non_blob_inputs >= 4);
 
-        if (mlasAvailable() && !has_mask &&
+        if ((flashAttentionEnabled() || mlasAvailable()) && !has_mask &&
             batch_size > 0 && num_heads > 0 && seq_len > 0 &&
             qkv_head_sizes[0] > 0 && qkv_head_sizes[2] > 0)
         {
@@ -386,6 +402,11 @@ class AttentionLayerImpl CV_FINAL : public AttentionLayer {
             const int S   = (int)seq_len;
             const int Dqk = (int)qkv_head_sizes[0];
             const int Dv  = (int)qkv_head_sizes[2];
+            if (flashAttentionEnabled()) {
+                // Arm: flash attention on the core GEMM engine.
+                flashAttention(Q, K, V, outputs[0].ptr<float>(), B, H, S, S, Dqk, Dv, scale);
+                return;
+            }
             // ORT-style default tiling, clamped to the actual sequence length.
             const int q_block  = std::min(256, S);
             const int kv_block = std::min(256, S);
@@ -564,6 +585,7 @@ class AttentionLayerImpl CV_FINAL : public AttentionLayer {
     std::vector<float> packed_weight_q;
     std::vector<float> packed_weight_k;
     std::vector<float> packed_weight_v;
+    EngineGemmB engine_weight[3];  // Q, K, V projections packed for the core GEMM engine (Arm)
     std::vector<unsigned char> flash_scratch;
 
     FastGemmOpt opt;

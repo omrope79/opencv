@@ -6,6 +6,7 @@
 
 #include "../precomp.hpp"
 #include "cpu_kernels/mlas_gemm.hpp"
+#include "cpu_kernels/flash_attention.hpp"
 
 namespace cv { namespace dnn {
 
@@ -99,6 +100,15 @@ public:
         const int S_kv = V.size[2];
         const int D_v  = V.size[3];
 
+        // Arm: engine flash attention reads K^T as it is, so no re-transpose when nothing is broadcast.
+        const bool q_full = Bq == B && Hq == H;
+        const bool flash = flashAttentionEnabled() && q_full;
+        if (flash && Bk == B && Hk == H && Bv == B && Hv == H) {
+            flashAttention(Q.ptr<float>(), KT.ptr<float>(), V.ptr<float>(), Y.ptr<float>(),
+                           B, H, S_q, S_kv, D, D_v, effectiveScale(D), true);
+            return;
+        }
+
         // Re-transpose K^T (Bk,Hk,D,S_kv) -> K (B,H,S_kv,D) for MlasFlashAttention, broadcasting a size-1 batch or head dim.
         Mat &K = internals[0];
         const float* kT_data = KT.ptr<const float>();
@@ -128,6 +138,12 @@ public:
                                 v_bhd_stride * sizeof(float));
             });
             v_data = vb;
+        }
+
+        if (flash) {
+            flashAttention(Q.ptr<float>(), K.ptr<float>(), v_data, Y.ptr<float>(),
+                           B, H, S_q, S_kv, D, D_v, effectiveScale(D), false);
+            return;
         }
 
         const int q_block  = std::min(256, S_q);
