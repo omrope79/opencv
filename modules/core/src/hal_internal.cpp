@@ -48,6 +48,9 @@
 #ifdef HAVE_LAPACK
 
 #include "opencv_lapack.h"
+#if CV_NEON && CV_NEON_AARCH64 && defined(HAVE_LAPACK_BUILTIN)
+#include "gemm/gemm_engine.hpp"
+#endif
 
 #include <cmath>
 #include <algorithm>
@@ -167,6 +170,10 @@ CV_ANNOTATE_NO_SANITIZE_MEMORY lapack_LU(fptype* a, size_t a_step, int m, fptype
     *info = static_cast<int>(_info[0]);
 #endif
     int retcode = *info >= 0 ? CV_HAL_ERROR_OK : CV_HAL_ERROR_NOT_IMPLEMENTED;
+
+    // on decline the caller runs its own LU over this same buffer, so hand it back untransposed
+    if (retcode == CV_HAL_ERROR_NOT_IMPLEMENTED)
+        transpose_square_inplace(a, lda, m);
 
     int sign = 0;
     if(*info == 0)
@@ -379,7 +386,12 @@ lapack_QR(fptype* a, size_t a_step, int m, int n, int k, fptype* b, size_t b_ste
 
             CV_ANNOTATE_MEMORY_IS_INITIALIZED(info, sizeof(int));
             if (*info < 0)
+            {
+                // same here: the m == n path transposed a in place and the caller falls back on it
+                if (m == n)
+                    transpose_square_inplace(a, lda, m);
                 return CV_HAL_ERROR_NOT_IMPLEMENTED;
+            }
 
             lwork = cvRound(work1); //optimal buffer size
             std::vector<fptype> workBufMemHolder(lwork + 1);
@@ -404,7 +416,11 @@ lapack_QR(fptype* a, size_t a_step, int m, int n, int k, fptype* b, size_t b_ste
 
             CV_ANNOTATE_MEMORY_IS_INITIALIZED(info, sizeof(int));
             if (*info < 0)
+            {
+                if (m == n)
+                    transpose_square_inplace(a, lda, m);
                 return CV_HAL_ERROR_NOT_IMPLEMENTED;
+            }
 
             lwork = cvRound(work1); //optimal buffer size
             std::vector<fptype> workBufMemHolder(lwork + 1);
@@ -427,7 +443,11 @@ lapack_QR(fptype* a, size_t a_step, int m, int n, int k, fptype* b, size_t b_ste
 
         CV_ANNOTATE_MEMORY_IS_INITIALIZED(info, sizeof(int));
         if (*info < 0)
+        {
+            if (m == n)
+                transpose_square_inplace(a, lda, m);
             return CV_HAL_ERROR_NOT_IMPLEMENTED;
+        }
 
         lwork = cvRound(work1); //optimal buffer size
         std::vector<fptype> workBufMemHolder(lwork + 1);
@@ -751,6 +771,11 @@ int lapack_gemm32f(const float *src1, size_t src1_step, const float *src2, size_
 {
     if(!shouldUseLapackGemm(m, n, k, flags))
         return CV_HAL_ERROR_NOT_IMPLEMENTED;
+#if CV_NEON && CV_NEON_AARCH64 && defined(HAVE_LAPACK_BUILTIN)
+    // AArch64: the GEMM engine is faster than the built-in reference LAPACK on the shapes LAPACK takes.
+    if (cv::gemm_engine::gemm32f(src1, src1_step, src2, src2_step, alpha, src3, src3_step, beta, dst, dst_step, m, n, k, flags))
+        return CV_HAL_ERROR_OK;
+#endif
     return lapack_gemm(src1, src1_step, src2, src2_step, alpha, src3, src3_step, beta, dst, dst_step, m, n, k, flags);
 }
 
