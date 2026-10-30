@@ -2053,6 +2053,41 @@ INSTANTIATE_TEST_CASE_P(/**/, Layer_Test_GlobalPooling, testing::Combine(
     testing::Bool()),
     GlobalPoolingParamName());
 
+typedef testing::TestWithParam<tuple<MatShape, bool> > Layer_Test_GlobalPoolingBlock;
+TEST_P(Layer_Test_GlobalPoolingBlock, EmptyBatch)
+{
+    const MatShape sizes = std::get<0>(GetParam());
+    const bool useMax = std::get<1>(GetParam());
+    const int C0 = 8;
+    std::vector<int> blockSizes(sizes.begin(), sizes.end());
+    blockSizes[1] = (sizes[1] + C0 - 1) / C0;
+    blockSizes.push_back(C0);
+    Mat inp(MatShape(blockSizes, DATA_LAYOUT_BLOCK, sizes[1]), CV_32F);
+
+    LayerParams lp;
+    lp.name = "testGlobalPoolingBlock";
+    lp.type = "Pooling";
+    lp.set("pool", useMax ? "MAX" : "AVE");
+    lp.set("global_pooling", true);
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+
+    std::vector<MatShape> inputs(1, inp.shape()), outputs, internals;
+    layer->getMemoryShapes(inputs, 1, outputs, internals);
+    std::vector<Mat> input(1, inp), output(1, Mat(outputs[0], CV_32F));
+    layer->finalize(input, output);
+    layer->forward(input, output, std::vector<Mat>());
+
+    MatShape expected = inp.shape();
+    for (int d = 2; d < expected.dims - 1; d++)
+        expected[d] = 1;
+    EXPECT_EQ(expected, output[0].shape());
+}
+
+INSTANTIATE_TEST_CASE_P(/**/, Layer_Test_GlobalPoolingBlock, testing::Combine(
+    testing::Values(MatShape{0, 16, 4, 5}),
+    testing::Bool()),
+    GlobalPoolingParamName());
+
 typedef testing::TestWithParam<tuple<Vec4i, int, tuple<Backend, Target> > > Layer_Test_ShuffleChannel;
 TEST_P(Layer_Test_ShuffleChannel, Accuracy)
 {
@@ -4178,6 +4213,65 @@ TEST(Test_MatMul, NoBiasIgnoresOutputContents)
         Mat expected;
         gemm(A, B, 1., noArray(), 0., expected);
         normAssert(outputs[0], expected, "MatMul no-bias output mismatch", 1e-4, 1e-4);
+    }
+}
+
+TEST(Test_SoftmaxCrossEntropyLoss, RejectMismatchedWeightsAndLabels)
+{
+    const int N = 2, C = 64;
+    Mat scores(std::vector<int>{N, C}, CV_32F);
+    randu(scores, -1, 1);
+    Mat labels(std::vector<int>{N}, CV_32S);
+    labels.at<int>(0) = C - 1;
+    labels.at<int>(1) = 3;
+
+    LayerParams lp;
+    lp.type = "SoftmaxCrossEntropyLoss";
+    lp.name = "sce_weights";
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+    ASSERT_TRUE(layer);
+
+    // weights must hold one value per class
+    std::vector<Mat> inputs{scores, labels, Mat(std::vector<int>{1}, CV_32F, Scalar(1))};
+    std::vector<Mat> outputs;
+    EXPECT_ANY_THROW(runLayer(layer, inputs, outputs));
+
+    // probability labels must cover every sample of the scores
+    Mat probs(std::vector<int>{1, C}, CV_32F, Scalar(1.f / C));
+    inputs = {scores, probs};
+    EXPECT_ANY_THROW(runLayer(layer, inputs, outputs));
+
+    // valid weights give the weighted mean loss, for both float32 and float16 weights
+    Mat weights(std::vector<int>{C}, CV_32F);
+    for (int c = 0; c < C; c++)
+        weights.at<float>(c) = 0.25f * (c % 8 + 1);
+
+    double num = 0, den = 0;
+    for (int n = 0; n < N; n++)
+    {
+        const float* x = scores.ptr<float>(n);
+        double maxv = x[0];
+        for (int c = 1; c < C; c++)
+            maxv = std::max(maxv, (double)x[c]);
+        double sumExp = 0;
+        for (int c = 0; c < C; c++)
+            sumExp += std::exp(x[c] - maxv);
+        const int y = labels.at<int>(n);
+        const double wy = weights.at<float>(y);
+        num += wy * (std::log(sumExp) + maxv - x[y]);
+        den += wy;
+    }
+    const double ref = num / den;
+
+    for (int wtype : {CV_32F, CV_16F})
+    {
+        Mat w;
+        weights.convertTo(w, wtype);
+        inputs = {scores, labels, w};
+        ASSERT_NO_THROW(runLayer(layer, inputs, outputs)) << typeToString(wtype);
+        ASSERT_EQ(outputs.size(), (size_t)1);
+        ASSERT_EQ(outputs[0].total(), (size_t)1);
+        EXPECT_NEAR(outputs[0].ptr<float>()[0], ref, 1e-5) << typeToString(wtype);
     }
 }
 
