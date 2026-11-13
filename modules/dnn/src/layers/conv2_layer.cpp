@@ -1363,7 +1363,6 @@ public:
 
     // Weights for forwardMlasIm2col(), (Cout, Cin*kh*kw); empty when the path is not used.
     Mat im2colWeights_;
-    }
 
     // im2col + GEMM conv path: weights packed on first use; the mode is read once in setWeights().
     EngineGemmB conv_gemm_B_;
