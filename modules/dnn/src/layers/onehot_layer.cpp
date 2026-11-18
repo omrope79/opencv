@@ -170,7 +170,7 @@ private:
                 size_t base = hi * ((size_t)localDepth * localOutStep) + lo;
                 localOutPtr[base + (size_t)wrapped * localOutStep] = localOnVal;
             }
-        });
+        }, (double)inTotal / 65536);
     }
 
 public:

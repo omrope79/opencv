@@ -134,7 +134,7 @@ public:
 
         const int outer_size = indices.total() / last_indices_dim;
         const int inner_size = out.total() / outer_size;
-        const int nstripes =  outer_size * inner_size / 1024;
+        const double nstripes = (double)outer_size * inner_size / 65536;
 
         size_t num_slices_per_batch = 1;
         for (int d = batch_dims; d < static_cast<int>(q) - 1; ++d)

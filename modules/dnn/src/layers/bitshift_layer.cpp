@@ -59,7 +59,7 @@ void runBitShift(const Mat& input, const Mat& shift, Mat& output, int direction)
         parallel_for_(Range(0, (int)numElements), [&](const Range& r){
             for (int i = r.start; i < r.end; ++i)
                 outputPtr[i] = doShift<T>(inputPtr[i], shiftScalar, direction, BitWidth);
-        });
+        }, (double)numElements / 65536);
     }
     else
     {
@@ -69,7 +69,7 @@ void runBitShift(const Mat& input, const Mat& shift, Mat& output, int direction)
         parallel_for_(Range(0, (int)numElements), [&](const Range& r){
             for (int i = r.start; i < r.end; ++i)
                 outputPtr[i] = doShift<T>(inputPtr[i], shiftPtr[i], direction, BitWidth);
-        });
+        }, (double)numElements / 65536);
     }
 }
 
