@@ -25,8 +25,14 @@ int vectorLength()
 }
 
 // Writes alpha*acc (+ beta*C) for one row of ZA through the column mask pc.
+// With alpha 1 the row goes straight from ZA to memory: much faster than reading it out first.
 #define CV_SME_STORE(tile, slice, ptr, pc)                                      \
     do {                                                                        \
+        if (direct)                                                             \
+        {                                                                       \
+            svst1_hor_za32(tile, slice, pc, ptr);                               \
+            break;                                                              \
+        }                                                                       \
         svfloat32_t acc = svread_hor_za32_f32_m(svundef_f32(), pt, tile, slice); \
         if (beta == 0.f)                                                        \
             svst1_f32(pc, ptr, svmul_f32_x(pt, acc, va));                       \
@@ -39,6 +45,9 @@ int vectorLength()
         }                                                                       \
     } while (0)
 
+// For beta 1 with a direct store, C is loaded into ZA instead of being added on the way out.
+#define CV_SME_LOAD(tile, slice, ptr, pc) svld1_hor_za32(tile, slice, pc, ptr)
+
 // 2VL x 2VL tiles: A panels of 2VL rows times B panels of 2VL columns, all four ZA tiles.
 __arm_new("za") __arm_locally_streaming
 static void kernel2x2(int m, int n, int k, const float* A, size_t aps, const float* B, size_t bps,
@@ -47,6 +56,7 @@ static void kernel2x2(int m, int n, int k, const float* A, size_t aps, const flo
     const int vl = (int)svcntw(), W = 2 * vl;
     const svbool_t pt = svptrue_b32();
     const svfloat32_t va = svdup_f32(alpha), vb = svdup_f32(beta);
+    const bool direct = alpha == 1.f && (beta == 0.f || beta == 1.f);
     for (int j = 0; j < n; j += W)
     {
         const float* bp = B + (size_t)(j / W) * bps;
@@ -55,7 +65,25 @@ static void kernel2x2(int m, int n, int k, const float* A, size_t aps, const flo
         {
             const float* a = A + (size_t)(i / W) * aps;
             const float* b = bp;
+            const int rows = m - i < W ? m - i : W;
             svzero_za();
+            if (direct && beta != 0.f)
+            {
+                for (int r = 0; r < rows; r++)
+                {
+                    const float* c = C + (size_t)(i + r) * ldc + j;
+                    if (r < vl)
+                    {
+                        CV_SME_LOAD(0, r, c, pc0);
+                        CV_SME_LOAD(1, r, c + vl, pc1);
+                    }
+                    else
+                    {
+                        CV_SME_LOAD(2, r - vl, c, pc0);
+                        CV_SME_LOAD(3, r - vl, c + vl, pc1);
+                    }
+                }
+            }
             for (int p = 0; p < k; p++, a += W, b += W)
             {
                 svfloat32_t a0 = svld1_f32(pt, a), a1 = svld1_f32(pt, a + vl);
@@ -65,7 +93,6 @@ static void kernel2x2(int m, int n, int k, const float* A, size_t aps, const flo
                 svmopa_za32_f32_m(2, pt, pt, a1, b0);
                 svmopa_za32_f32_m(3, pt, pt, a1, b1);
             }
-            const int rows = m - i < W ? m - i : W;
             for (int r = 0; r < rows; r++)
             {
                 float* c = C + (size_t)(i + r) * ldc + j;
@@ -92,6 +119,7 @@ static void kernel1x4(int m, int n, int k, const float* A, size_t aps, const flo
     const int vl = (int)svcntw(), W = 2 * vl;
     const svbool_t pt = svptrue_b32();
     const svfloat32_t va = svdup_f32(alpha), vb = svdup_f32(beta);
+    const bool direct = alpha == 1.f && (beta == 0.f || beta == 1.f);
     for (int j = 0; j < n; j += 2 * W)
     {
         const float* bp0 = B + (size_t)(j / W) * bps;
@@ -103,7 +131,19 @@ static void kernel1x4(int m, int n, int k, const float* A, size_t aps, const flo
             const float* a = A + (size_t)(i / vl) * aps;
             const float* b0p = bp0;
             const float* b1p = bp1;
+            const int rows = m - i < vl ? m - i : vl;
             svzero_za();
+            if (direct && beta != 0.f)
+            {
+                for (int r = 0; r < rows; r++)
+                {
+                    const float* c = C + (size_t)(i + r) * ldc + j;
+                    CV_SME_LOAD(0, r, c, pc0);
+                    CV_SME_LOAD(1, r, c + vl, pc1);
+                    CV_SME_LOAD(2, r, c + W, pc2);
+                    CV_SME_LOAD(3, r, c + W + vl, pc3);
+                }
+            }
             for (int p = 0; p < k; p++, a += vl, b0p += W, b1p += W)
             {
                 svfloat32_t a0 = svld1_f32(pt, a);
@@ -112,7 +152,6 @@ static void kernel1x4(int m, int n, int k, const float* A, size_t aps, const flo
                 svmopa_za32_f32_m(2, pt, pt, a0, svld1_f32(pt, b1p));
                 svmopa_za32_f32_m(3, pt, pt, a0, svld1_f32(pt, b1p + vl));
             }
-            const int rows = m - i < vl ? m - i : vl;
             for (int r = 0; r < rows; r++)
             {
                 float* c = C + (size_t)(i + r) * ldc + j;
@@ -125,6 +164,7 @@ static void kernel1x4(int m, int n, int k, const float* A, size_t aps, const flo
     }
 }
 #undef CV_SME_STORE
+#undef CV_SME_LOAD
 
 void gemmPanels(int m, int n, int k, int R, const float* A, size_t aPanelStride,
                 const float* B, size_t bPanelStride, float alpha, float beta, float* C, size_t ldc)
