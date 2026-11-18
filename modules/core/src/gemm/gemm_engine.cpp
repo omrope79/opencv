@@ -514,6 +514,34 @@ bool gemm32fUsesSME()
     return smeEnabled();
 }
 
+int gemm32fPanelRowsA()
+{
+    return 2 * smeVectorLength();
+}
+
+bool gemm32fPanelsA(const float* Apanels, int m, const void* packedB, int j0, int nc,
+                    float* C, size_t C_step, float beta)
+{
+    const PackedBHeader& hdr = *(const PackedBHeader*)packedB;
+    CV_Assert(packedB && hdr.magic == PACKED_MAGIC);
+    const int R = gemm32fPanelRowsA();
+    if (R == 0 || hdr.format != PACKED_PANELS || !hdr.sme || hdr.width != R)
+        return false;
+    CV_Assert(j0 >= 0 && j0 % R == 0 && nc >= 0 && j0 + nc <= hdr.n && m >= 0 && C_step % sizeof(float) == 0);
+#if defined(CV_GEMM_HAVE_SME)
+    if (m > 0 && nc > 0)
+    {
+        const size_t panel = (size_t)R * hdr.k;
+        const float* B = (const float*)((const uchar*)packedB + PACKED_HEADER_SIZE) + (size_t)(j0 / R) * panel;
+        sme::gemmPanels(m, nc, hdr.k, R, Apanels, panel, B, panel, 1.f, beta, C, C_step / sizeof(float));
+    }
+    return true;
+#else
+    CV_UNUSED(Apanels); CV_UNUSED(C); CV_UNUSED(beta);
+    return false;
+#endif
+}
+
 size_t gemm32fPackBSize(int n, int k, int flags)
 {
     CV_INSTRUMENT_REGION();
