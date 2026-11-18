@@ -10,6 +10,7 @@
 #include "cpu_kernels/mlas_gemm.hpp"
 #include "cpu_kernels/conv2_gemm.hpp"
 #include "opencv2/core/hal/intrin.hpp"
+#include <opencv2/core/utils/configuration.private.hpp>
 #include <algorithm>
 #include <cstring>
 
@@ -1027,7 +1028,12 @@ public:
             return false;
         const int Cout = wshape0[0], K = wshape0[1] * wshape0[2] * wshape0[3];
         const double macs = (double)cs.outshape[0] * cs.outshape[2] * cs.outshape[3] * Cout * K;
-        return Cout >= 64 && K >= 256 && macs >= 1e8;
+        // Temporary switch for in-model A/B: OPENCV_DNN_CONV_GEMM_RULE=0 keeps the old rule.
+        static const bool newRule = utils::getConfigurationParameterBool("OPENCV_DNN_CONV_GEMM_RULE", true);
+        if (!newRule)
+            return Cout >= 64 && K >= 256 && macs >= 1e8;
+        // With im2col writing the SME panels directly, a long reduction pays off at any size.
+        return Cout >= 32 && (K >= 256 || macs >= 1e8);
     }
 
     // im2col + GEMM conv path: FP32, 2D, not grouped, block size 8 (see conv2GemmMode()).
