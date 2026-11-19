@@ -98,6 +98,27 @@ class MatMulNBitsLayerImpl CV_FINAL : public MatMulNBitsLayer {
         }
     }
 
+#if CV_SIMD128
+    // 32 4-bit weights (16 bytes, low nibble first) as (q - 8) * scale, in order, in w[0..7].
+    static inline void dequant32x4(const uchar* p, const v_float32x4& s, const v_float32x4& zs,
+                                   v_float32x4* w) {
+        const v_uint8x16 b = v_load(p), mask = v_setall_u8(15);
+        const v_uint8x16 lo = v_and(b, mask);
+        const v_uint8x16 hi = v_and(v_reinterpret_as_u8(v_shr<4>(v_reinterpret_as_u16(b))), mask);
+        v_uint8x16 q0, q1;
+        v_zip(lo, hi, q0, q1);
+        v_uint16x8 h[4];
+        v_expand(q0, h[0], h[1]);
+        v_expand(q1, h[2], h[3]);
+        for (int i = 0; i < 4; i++) {
+            v_uint32x4 u0, u1;
+            v_expand(h[i], u0, u1);
+            w[2 * i]     = v_fma(v_cvt_f32(v_reinterpret_as_s32(u0)), s, zs);
+            w[2 * i + 1] = v_fma(v_cvt_f32(v_reinterpret_as_s32(u1)), s, zs);
+        }
+    }
+#endif
+
     template<int BITS>
     void runImpl(const Mat& A, const Mat& B, const Mat& scales, Mat& Y) const {
         const int M = static_cast<int>(A.total() / K);
@@ -108,6 +129,14 @@ class MatMulNBitsLayerImpl CV_FINAL : public MatMulNBitsLayer {
         const uchar* bq = B.ptr<const uchar>();
         const float* sc = scales.ptr<const float>();
         float* y = Y.ptr<float>();
+#if CV_SIMD128
+        // 4-bit weights in whole 32-element groups: unpacked with SIMD, never stored for one row
+        const bool simd4 = BITS == 4 && block_size % 32 == 0 && K % 32 == 0;
+#else
+        const bool simd4 = false;
+#endif
+        // ~64k multiply-adds per stripe: one stripe per column costs more than the column
+        const double nstripes = std::max(1., std::min((double)N, (double)N * M * K / (1 << 16)));
 
         // Each range owns a disjoint set of output columns n, so the column writes are race-free.
         parallel_for_(Range(0, N), [&](const Range& r) {
@@ -116,6 +145,34 @@ class MatMulNBitsLayerImpl CV_FINAL : public MatMulNBitsLayer {
             for (int n = r.start; n < r.end; n++) {
                 const uchar* bq_n = bq + static_cast<size_t>(n) * n_blk * blob_bytes;
                 const float* sc_n = sc + static_cast<size_t>(n) * n_blk;
+#if CV_SIMD128
+                if (simd4) {
+                    v_float32x4 w[8];
+                    if (M == 1) {
+                        v_float32x4 s0 = v_setzero_f32(), s1 = s0, s2 = s0, s3 = s0;
+                        for (int k = 0; k < K; k += 32) {
+                            const v_float32x4 s = v_setall_f32(sc_n[k / block_size]);
+                            dequant32x4(bq_n + k / 2, s, v_mul(s, v_setall_f32(-8.f)), w);
+                            s0 = v_fma(v_load(a + k),      w[0], s0);
+                            s1 = v_fma(v_load(a + k + 4),  w[1], s1);
+                            s2 = v_fma(v_load(a + k + 8),  w[2], s2);
+                            s3 = v_fma(v_load(a + k + 12), w[3], s3);
+                            s0 = v_fma(v_load(a + k + 16), w[4], s0);
+                            s1 = v_fma(v_load(a + k + 20), w[5], s1);
+                            s2 = v_fma(v_load(a + k + 24), w[6], s2);
+                            s3 = v_fma(v_load(a + k + 28), w[7], s3);
+                        }
+                        y[n] = v_reduce_sum(v_add(v_add(s0, s1), v_add(s2, s3)));
+                        continue;
+                    }
+                    for (int k = 0; k < K; k += 32) {
+                        const v_float32x4 s = v_setall_f32(sc_n[k / block_size]);
+                        dequant32x4(bq_n + k / 2, s, v_mul(s, v_setall_f32(-8.f)), w);
+                        for (int i = 0; i < 8; i++)
+                            v_store(wcol.data() + k + 4 * i, w[i]);
+                    }
+                } else
+#endif
                 for (int blk = 0; blk < n_blk; blk++)
                     dequantBlock<BITS>(bq_n + static_cast<size_t>(blk) * blob_bytes, blob_bytes,
                                        sc_n[blk], wcol.data() + blk * block_size);
@@ -145,7 +202,7 @@ class MatMulNBitsLayerImpl CV_FINAL : public MatMulNBitsLayer {
                     y[static_cast<size_t>(m) * N + n] = acc;
                 }
             }
-        }, static_cast<double>(N) * M * K * (1 / 1024.0));
+        }, nstripes);
     }
 
     void forward(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr, OutputArrayOfArrays internals_arr) CV_OVERRIDE {
