@@ -136,53 +136,153 @@ struct ModelFusionAttention
         return isScalarBinOp(prog, idx, NaryEltwiseLayer::OPERATION::DIV, val);
     }
 
-    // True if `arg` is produced by the dynamic scale chain Sqrt<-Cast<-Div(1,.)<-Sqrt<-Cast<-Slice<-Shape; visited ops are appended to `chain_ops`.
-    bool isRuntimeQKScaleChain(const vector<Ptr<LayerInfo>>& prog, Arg arg,
-                                std::set<int>& chain_ops) const
+    // Reads a constant int tensor (int32 or int64) into `v`.
+    bool readConstInts(Arg a, vector<int>& v) const
     {
-        const std::vector<std::string> expected = {
-            "Sqrt", "Cast2", "NaryEltwise" /*Div*/, "Sqrt",
-            "Cast2", "Slice2", "Shape"
-        };
-        Arg cur = arg;
-        for (const std::string& want : expected) {
-            auto it = producer_.find(cur.idx);
-            if (it == producer_.end()) return false;
-            int idx = it->second;
-            if (idx < 0 || idx >= (int)prog.size() || !prog[idx]) return false;
-            const Ptr<LayerInfo>& l = prog[idx];
-            if (want == "NaryEltwise") {
-                NaryEltwiseLayer* elt = dynamic_cast<NaryEltwiseLayer*>(l.get());
-                if (!elt || elt->op != NaryEltwiseLayer::OPERATION::DIV) return false;
+        if (!netimpl->isConstArg(a)) return false;
+        Mat t = netimpl->argTensor(a);
+        v.clear();
+        if (t.type() == CV_64S)
+            for (size_t i = 0; i < t.total(); i++) v.push_back((int)t.ptr<int64_t>()[i]);
+        else if (t.type() == CV_32S)
+            for (size_t i = 0; i < t.total(); i++) v.push_back(t.ptr<int32_t>()[i]);
+        else
+            return false;
+        return true;
+    }
 
-                bool one_seen = false;
-                Arg runtime_in;
-                bool runtime_seen = false;
-                for (Arg in : l->inputs) {
-                    if (netimpl->isConstArg(in)) {
-                        Mat t = netimpl->argTensor(in);
-                        if (t.total() != 1) return false;
-                        float v = 0.f;
-                        if      (t.type() == CV_32F) v = t.at<float>(0);
-                        else if (t.type() == CV_64F) v = (float)t.at<double>(0);
-                        else return false;
-                        if (std::abs(v - 1.f) > 1e-5f) return false;
-                        one_seen = true;
-                    } else {
-                        runtime_in = in;
-                        runtime_seen = true;
-                    }
-                }
-                if (!one_seen || !runtime_seen) return false;
-                chain_ops.insert(idx);
-                cur = runtime_in;
-            } else {
-                if (l->type != want) return false;
-                chain_ops.insert(idx);
-                if (l->inputs.empty()) return false;
-                cur = l->inputs[0];
-            }
+    // A Cast to float32, which does nothing to the float32 activations of a fused attention
+    // (exporters emit these around Softmax for mixed-precision code paths).
+    bool isFloatIdentityCast(const vector<Ptr<LayerInfo>>& prog, int idx) const
+    {
+        if (idx < 0 || idx >= (int)prog.size() || !prog[idx]) return false;
+        if (!dynamic_cast<Cast2Layer*>(prog[idx].get()) && !dynamic_cast<CastLayer*>(prog[idx].get()))
+            return false;
+        if (prog[idx]->inputs.size() != 1 || prog[idx]->outputs.size() != 1) return false;
+        std::vector<MatType> outs, internals;
+        try {
+            prog[idx]->getTypes(std::vector<MatType>{CV_32F}, 1, 0, outs, internals);
+        } catch (const cv::Exception&) {
+            return false;
         }
+        return outs.size() == 1 && outs[0] == CV_32F;
+    }
+
+    // Follows `idx` through float32 identity Casts, recording them in `cast_ops`; returns the
+    // first op that is not one (or -1 where the chain branches).
+    int skipIdentityCasts(const vector<Ptr<LayerInfo>>& prog, int idx, std::set<int>& cast_ops) const
+    {
+        while (isFloatIdentityCast(prog, idx)) {
+            cast_ops.insert(idx);
+            idx = singleConsumer(prog[idx]->outputs[0]);
+        }
+        return idx;
+    }
+
+    // True if `arg` is produced by the dynamic scale chain
+    //   Sqrt <- [Cast] <- Div(1, .) <- Sqrt <- Cast <- Slice <- Shape
+    // i.e. head_dim^-1/4, as PyTorch writes scaled_dot_product_attention when it scales Q and K
+    // separately. Visited ops are appended to `chain_ops`. With `shape_src` set, the Shape must
+    // read that tensor and the Slice must take its last dim, so the scale is known to be
+    // head_dim^-1/4 of exactly this attention.
+    bool isRuntimeQKScaleChain(const vector<Ptr<LayerInfo>>& prog, Arg arg,
+                               std::set<int>& chain_ops, const Arg* shape_src = nullptr) const
+    {
+        std::set<int> ops;
+        auto prod = [&](Arg a) -> int {
+            int p = producerOf(a);
+            return p >= 0 && p < (int)prog.size() && prog[p] && !prog[p]->inputs.empty() ? p : -1;
+        };
+        int p = prod(arg);
+        if (p < 0 || prog[p]->type != "Sqrt") return false;
+        ops.insert(p);
+        Arg cur = prog[p]->inputs[0];
+        p = prod(cur);
+        if (p >= 0 && prog[p]->type == "Cast2") {  // optional: some exporters cast the reciprocal
+            ops.insert(p);
+            cur = prog[p]->inputs[0];
+            p = prod(cur);
+        }
+        // Div(1, sqrt(d)): the constant 1 must be the numerator.
+        NaryEltwiseLayer* div = p >= 0 ? dynamic_cast<NaryEltwiseLayer*>(prog[p].get()) : nullptr;
+        if (!div || div->op != NaryEltwiseLayer::OPERATION::DIV || prog[p]->inputs.size() != 2) return false;
+        Arg num = prog[p]->inputs[0], den = prog[p]->inputs[1];
+        if (!netimpl->isConstArg(num) || netimpl->isConstArg(den)) return false;
+        {
+            Mat t = netimpl->argTensor(num);
+            if (t.total() != 1) return false;
+            float v = 0.f;
+            if      (t.type() == CV_32F) v = t.at<float>(0);
+            else if (t.type() == CV_64F) v = (float)t.at<double>(0);
+            else return false;
+            if (std::abs(v - 1.f) > 1e-5f) return false;
+        }
+        ops.insert(p);
+        cur = den;
+        for (const char* want : {"Sqrt", "Cast2", "Slice2", "Shape"}) {
+            p = prod(cur);
+            if (p < 0 || prog[p]->type != want) return false;
+            ops.insert(p);
+            if (shape_src && std::string(want) == "Slice2") {
+                // Slice(Shape(x), -1): the last dim, whether the bounds are attributes or inputs.
+                Slice2Layer* sl = dynamic_cast<Slice2Layer*>(prog[p].get());
+                vector<int> starts;
+                if (prog[p]->inputs.size() >= 2 && !readConstInts(prog[p]->inputs[1], starts)) return false;
+                if (starts.empty() && sl) starts = sl->starts;
+                if (starts.size() != 1 || starts[0] != -1) return false;
+            }
+            if (shape_src && std::string(want) == "Shape") {
+                ShapeLayer* sh = dynamic_cast<ShapeLayer*>(prog[p].get());
+                if (!sh || sh->start != 0 || sh->end != INT_MAX) return false;
+                if (prog[p]->inputs[0].idx != shape_src->idx) return false;
+            }
+            cur = prog[p]->inputs[0];
+        }
+        chain_ops.insert(ops.begin(), ops.end());
+        return true;
+    }
+
+    // Adds the scale-chain ops (Sqrt/Cast/Div/Slice/Shape) to `to_remove` when every consumer is
+    // removed too, by this fusion or as another chain op: Q and K share the upstream of the chain.
+    void addScaleChainOps(const vector<Ptr<LayerInfo>>& prog, const std::set<int>& chain_ops,
+                          std::set<int>& to_remove) const
+    {
+        for (int op_idx : chain_ops) {
+            if (op_idx < 0 || op_idx >= (int)prog.size() || !prog[op_idx]) continue;
+            bool all_consumers_removed = true;
+            for (Arg out : prog[op_idx]->outputs) {
+                auto cit = consumers_.find(out.idx);
+                if (cit == consumers_.end()) continue;
+                for (int c : cit->second) {
+                    if (to_remove.count(c) || chain_ops.count(c)) continue;
+                    all_consumers_removed = false;
+                    break;
+                }
+                if (!all_consumers_removed) break;
+            }
+            if (all_consumers_removed) to_remove.insert(op_idx);
+        }
+    }
+
+    // The scale Mul on a Q or K branch: a constant scalar (multiplies *const_scale), or the
+    // runtime head_dim^-1/4 chain (sets *runtime). `tensor` is the branch value the Mul scales.
+    bool readQKScaleMul(const vector<Ptr<LayerInfo>>& prog, int idx, Arg tensor, const Arg* shape_src,
+                        float* const_scale, bool* runtime, std::set<int>& chain_ops) const
+    {
+        float v = 1.f;
+        if (isScalarMul(prog, idx, &v)) {
+            if (v == 0.f) return false;
+            *const_scale *= v;
+            return true;
+        }
+        if (idx < 0 || idx >= (int)prog.size() || !prog[idx]) return false;
+        NaryEltwiseLayer* elt = dynamic_cast<NaryEltwiseLayer*>(prog[idx].get());
+        if (!elt || elt->op != NaryEltwiseLayer::OPERATION::PROD || prog[idx]->inputs.size() != 2) return false;
+        const auto& in = prog[idx]->inputs;
+        const int t = in[0].idx == tensor.idx ? 0 : in[1].idx == tensor.idx ? 1 : -1;
+        if (t < 0) return false;
+        if (!isRuntimeQKScaleChain(prog, in[1 - t], chain_ops, shape_src)) return false;
+        *runtime = true;
         return true;
     }
 
@@ -555,52 +655,105 @@ struct ModelFusionAttention
 
         Arg tr_out = prog[transpose_idx]->outputs[0];
         auto cit = consumers_.find(tr_out.idx);
-        if (cit == consumers_.end() || cit->second.size() != 3) return false;
+        if (cit == consumers_.end()) return false;
 
-        int gather_for_idx[3] = { -1, -1, -1 };  // [Q,K,V] = [0,1,2]
-        for (int c : cit->second) {
-            if (c < 0 || c >= (int)prog.size() || !prog[c]) return false;
-            Gather2Layer* g = dynamic_cast<Gather2Layer*>(prog[c].get());
-            if (!g || g->axis != 0 || prog[c]->inputs.size() < 2) return false;
-            Arg idx_arg = prog[c]->inputs[1];
-            if (!netimpl->isConstArg(idx_arg)) return false;
-            Mat t = netimpl->argTensor(idx_arg);
-            if (t.total() != 1) return false;
-            int v;
-            if      (t.type() == CV_64S) v = (int)t.at<int64_t>(0);
-            else if (t.type() == CV_32S) v = (int)t.at<int32_t>(0);
-            else return false;
-            if (v < 0 || v > 2 || gather_for_idx[v] != -1) return false;
-            gather_for_idx[v] = c;
+        // Unbind the leading "3" into Q, K, V: three Gathers (index 0, 1, 2), or one Split along
+        // axis 0 followed by a Squeeze of that axis on each part (torch.unbind as newer exporters
+        // write it). unbind_ops are the ops that do it; qkv_out[k] is the [B, H, S, D] result.
+        std::set<int> unbind_ops;
+        Arg qkv_out[3];
+        if (cit->second.size() == 3) {
+            int gather_for_idx[3] = { -1, -1, -1 };  // [Q,K,V] = [0,1,2]
+            for (int c : cit->second) {
+                if (c < 0 || c >= (int)prog.size() || !prog[c]) return false;
+                Gather2Layer* g = dynamic_cast<Gather2Layer*>(prog[c].get());
+                if (!g || g->axis != 0 || prog[c]->inputs.size() < 2) return false;
+                Arg idx_arg = prog[c]->inputs[1];
+                if (!netimpl->isConstArg(idx_arg)) return false;
+                Mat t = netimpl->argTensor(idx_arg);
+                if (t.total() != 1) return false;
+                int v;
+                if      (t.type() == CV_64S) v = (int)t.at<int64_t>(0);
+                else if (t.type() == CV_32S) v = (int)t.at<int32_t>(0);
+                else return false;
+                if (v < 0 || v > 2 || gather_for_idx[v] != -1) return false;
+                gather_for_idx[v] = c;
+            }
+            for (int k = 0; k < 3; k++) {
+                if (gather_for_idx[k] < 0) return false;
+                unbind_ops.insert(gather_for_idx[k]);
+                qkv_out[k] = prog[gather_for_idx[k]]->outputs[0];
+            }
+        } else if (cit->second.size() == 1) {
+            const int split_idx = cit->second[0];
+            if (split_idx < 0 || split_idx >= (int)prog.size() || !prog[split_idx]) return false;
+            Split2Layer* sp = dynamic_cast<Split2Layer*>(prog[split_idx].get());
+            if (!sp || sp->axis != 0 || prog[split_idx]->outputs.size() != 3) return false;
+            vector<int> sizes;  // optional split input: one row each
+            if (prog[split_idx]->inputs.size() >= 2 && readConstInts(prog[split_idx]->inputs[1], sizes) &&
+                sizes != vector<int>{1, 1, 1})
+                return false;
+            if (!sp->split.empty() && sp->split != vector<int>{1, 1, 1}) return false;
+            unbind_ops.insert(split_idx);
+            for (int k = 0; k < 3; k++) {
+                const int sq = singleConsumer(prog[split_idx]->outputs[k]);
+                if (sq < 0 || !prog[sq]) return false;
+                SqueezeLayer* s = dynamic_cast<SqueezeLayer*>(prog[sq].get());
+                if (!s) return false;
+                vector<int> axes;
+                if (prog[sq]->inputs.size() >= 2 && !readConstInts(prog[sq]->inputs[1], axes)) return false;
+                if (axes.empty()) axes = s->axes;
+                if (axes != vector<int>{0}) return false;
+                unbind_ops.insert(sq);
+                qkv_out[k] = prog[sq]->outputs[0];
+            }
+        } else {
+            return false;
         }
-        const int q_gather = gather_for_idx[0];
-        const int k_gather = gather_for_idx[1];
-        const int v_gather = gather_for_idx[2];
-        if (q_gather < 0 || k_gather < 0 || v_gather < 0) return false;
 
-        Arg q_out = prog[q_gather]->outputs[0];
-        Arg k_out = prog[k_gather]->outputs[0];
-        Arg v_out = prog[v_gather]->outputs[0];
+        Arg q_out = qkv_out[0];
+        Arg k_out = qkv_out[1];
+        Arg v_out = qkv_out[2];
 
-        int q_mul_idx = singleConsumer(q_out);
-        float q_scale = 1.f;
-        if (!isScalarMul(prog, q_mul_idx, &q_scale)) return false;
-        if (q_scale == 0.f) return false;
+        // Q is scaled by a constant, or Q and K both by the runtime head_dim^-1/4 (its Shape reads Q).
+        auto eltOrMatMul = [](LayerInfo* L) {
+            return dynamic_cast<NaryEltwiseLayer*>(L) != nullptr || dynamic_cast<MatMulLayer*>(L) != nullptr;
+        };
+        std::set<int> qk_scale_chain_ops;
+        float qk_scale = 1.f;
+        bool q_runtime = false, k_runtime = false;
+        int q_mul_idx = findMatchingConsumer(prog, q_out, eltOrMatMul, nullptr);
+        if (!readQKScaleMul(prog, q_mul_idx, q_out, &q_out, &qk_scale, &q_runtime, qk_scale_chain_ops))
+            return false;
         int qk_matmul_idx = singleConsumer(prog[q_mul_idx]->outputs[0]);
         if (!isMatMul(prog, qk_matmul_idx)) return false;
 
         int k_trans_idx = singleConsumer(k_out);
         if (!isTranspose(prog, k_trans_idx)) return false;
         Arg k_trans_out = prog[k_trans_idx]->outputs[0];
+        // K^T goes into QK^T directly, or through its own scale Mul.
+        int k_mul_idx = -1;
+        Arg k_into_qk = k_trans_out;
+        const int k_next = singleConsumer(k_trans_out);
+        if (k_next != qk_matmul_idx) {
+            // A runtime K scale must come from Q's head_dim too (both Sqrts share one Div).
+            if (!readQKScaleMul(prog, k_next, k_trans_out, &q_out, &qk_scale, &k_runtime, qk_scale_chain_ops))
+                return false;
+            k_mul_idx = k_next;
+            k_into_qk = prog[k_mul_idx]->outputs[0];
+        }
+        if (q_runtime != k_runtime) return false;  // head_dim^-1/4 on one side only is not 1/sqrt(d)
         bool k_connected = false;
         for (Arg in : prog[qk_matmul_idx]->inputs)
-            if (in.idx == k_trans_out.idx) { k_connected = true; break; }
+            if (in.idx == k_into_qk.idx) { k_connected = true; break; }
         if (!k_connected) return false;
 
         int softmax_idx = singleConsumer(prog[qk_matmul_idx]->outputs[0]);
         if (!isSoftmax(prog, softmax_idx)) return false;
-        int av_matmul_idx = singleConsumer(prog[softmax_idx]->outputs[0]);
+        std::set<int> cast_ops;
+        int av_matmul_idx = skipIdentityCasts(prog, singleConsumer(prog[softmax_idx]->outputs[0]), cast_ops);
         if (!isMatMul(prog, av_matmul_idx)) return false;
+        extra_ops.insert(cast_ops.begin(), cast_ops.end());
         bool v_connected = false;
         for (Arg in : prog[av_matmul_idx]->inputs)
             if (in.idx == v_out.idx) { v_connected = true; break; }
@@ -625,9 +778,9 @@ struct ModelFusionAttention
         Mat bias_qkv = has_bias ? bias_mat.reshape(1, 1, &total_hidden).clone()
                                 : Mat(1, &total_hidden, CV_32F, Scalar(0));
 
-        // Attention `scale` is the pre-softmax divisor; Q was multiplied by
-        // q_scale, so scale = 1/q_scale.
-        const float param_scale = 1.0f / q_scale;
+        // Attention `scale` is the pre-softmax divisor. Constant scales multiply Q (and K), so
+        // scale = 1/(q_scale*k_scale); the runtime head_dim^-1/4 on both sides gives sqrt(d).
+        const float param_scale = q_runtime ? std::sqrt((float)head_dim) : 1.0f / qk_scale;
 
         LayerParams attn_params;
         attn_params.name = prog[qkv_matmul_idx]->name + "_fused_attention";
@@ -651,13 +804,15 @@ struct ModelFusionAttention
 
         std::set<int> to_remove = {
             qkv_matmul_idx, reshape_idx, transpose_idx,
-            q_gather, k_gather, v_gather,
             q_mul_idx, k_trans_idx,
             qk_matmul_idx, softmax_idx,
             av_matmul_idx, out_trans_idx, out_reshape_idx
         };
+        to_remove.insert(unbind_ops.begin(), unbind_ops.end());
+        if (k_mul_idx >= 0) to_remove.insert(k_mul_idx);
         if (add_idx >= 0) to_remove.insert(add_idx);
         for (int op : extra_ops) to_remove.insert(op);
+        addScaleChainOps(prog, qk_scale_chain_ops, to_remove);
 
         (void)input_hidden;  // input_hidden currently unused; kept for symmetry with existing path.
 
@@ -1168,7 +1323,13 @@ struct ModelFusionAttention
 
                     int cur_consumer = singleConsumer(cur_out);
                     if (!vit_style) {
-                        if (!isScalarDiv(prog, cur_consumer, &post_scale_val)) continue;
+                        // QK^T / c, or QK^T * c (SigLIP, CLIP-style exports): either way the
+                        // pre-softmax divisor.
+                        float post_mul = 1.f;
+                        if (isScalarMul(prog, cur_consumer, &post_mul) && post_mul != 0.f)
+                            post_scale_val = 1.f / post_mul;
+                        else if (!isScalarDiv(prog, cur_consumer, &post_scale_val))
+                            continue;
                         qk_div_idx = cur_consumer;
                         cur_out = prog[qk_div_idx]->outputs[0];
                         cur_consumer = singleConsumer(cur_out);
@@ -1185,7 +1346,8 @@ struct ModelFusionAttention
                     if (!isSoftmax(prog, softmax_idx)) continue;
 
                     Arg softmax_out = prog[softmax_idx]->outputs[0];
-                    int attnv_matmul_idx = singleConsumer(softmax_out);
+                    std::set<int> cast_ops;
+                    int attnv_matmul_idx = skipIdentityCasts(prog, singleConsumer(softmax_out), cast_ops);
                     if (!isMatMul(prog, attnv_matmul_idx)) continue;
 
                     Arg v_tr_out = prog[transpose_idx[v_slot]]->outputs[0];
@@ -1288,23 +1450,10 @@ struct ModelFusionAttention
                     if (qk_div_idx >= 0) to_remove.insert(qk_div_idx);
                     if (qk_add_idx >= 0) to_remove.insert(qk_add_idx);
                     for (int op : extra_ops) to_remove.insert(op);
+                    to_remove.insert(cast_ops.begin(), cast_ops.end());
 
-                    // Drop chain ops (Sqrt/Cast/Div/Slice/Shape) only if every consumer is also being removed — by this fusion or another chain op already in the set; the upstream is shared between Q and K branches so the chain is treated as a unit.
-                    for (int op_idx : qk_scale_chain_ops) {
-                        if (op_idx < 0 || op_idx >= (int)prog.size() || !prog[op_idx]) continue;
-                        bool all_consumers_removed = true;
-                        for (Arg out : prog[op_idx]->outputs) {
-                            auto cit = consumers_.find(out.idx);
-                            if (cit == consumers_.end()) continue;
-                            for (int c : cit->second) {
-                                if (to_remove.count(c) || qk_scale_chain_ops.count(c)) continue;
-                                all_consumers_removed = false;
-                                break;
-                            }
-                            if (!all_consumers_removed) break;
-                        }
-                        if (all_consumers_removed) to_remove.insert(op_idx);
-                    }
+                    // The scale chain is shared by the Q and K branches, so it goes as a unit.
+                    addScaleChainOps(prog, qk_scale_chain_ops, to_remove);
 
                     std::set<int> attn_out_args;
                     for (const Arg& o : attn_layer->outputs) attn_out_args.insert(o.idx);
