@@ -570,7 +570,8 @@ bool gemm32fPanelsA(const float* Apanels, int m, const void* packedB, int j0, in
     {
         const size_t panel = (size_t)R * hdr.k;
         const float* B = (const float*)((const uchar*)packedB + PACKED_HEADER_SIZE) + (size_t)(j0 / R) * panel;
-        sme::gemmPanels(m, nc, hdr.k, R, Apanels, panel, B, panel, 1.f, beta, C, C_step / sizeof(float));
+        sme::gemmPanels(m, nc, hdr.k, R, Apanels, panel, B, panel, 1.f, beta, C, C_step / sizeof(float),
+                        sme2Enabled());
     }
     return true;
 #else
