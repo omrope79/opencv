@@ -562,8 +562,9 @@ struct ModelFusionAttention
         return transpose_idx;
     }
 
-    // Combined-QKV attention: QKV proj -> Reshape ->
-    // Transpose -> 3 Gathers -> QK^T -> Softmax(no mask) -> *V.
+    // Combined-QKV attention: QKV proj -> Reshape [B, S, 3, H, D] -> unbind into Q, K, V
+    // (Transpose + 3 Gathers, Transpose + Split/Squeeze, or Split/Squeeze + a Transpose per part)
+    // -> scale Mul on Q (and K) -> QK^T -> [Add(bias or mask)] -> Softmax -> [Casts] -> *V.
     bool tryFuseCombinedQKV(const vector<Ptr<LayerInfo>>& prog, int qkv_matmul_idx,
                             std::set<int>& removed_ops,
                             vector<std::pair<int, Ptr<LayerInfo>>>& replacements)
@@ -641,28 +642,43 @@ struct ModelFusionAttention
             if (extractConstInt(prog, cinputs[2]) != 3) return false;
             num_heads = extractConstInt(prog, cinputs[3]);
             head_dim  = extractConstInt(prog, cinputs[4]);
-            if (num_heads <= 0 || head_dim <= 0) return false;
             collectShapeChain(prog, concat_idx, extra_ops);
         }
-        if (num_heads * head_dim != proj_hidden) return false;
+        // One of heads / head_dim may be inferred (-1, as in reshape(B, N, 3, heads, -1)): a token
+        // holds 3 * proj_hidden values, so it is proj_hidden / the other.
+        if (num_heads <= 0 && head_dim > 0 && proj_hidden % head_dim == 0)
+            num_heads = proj_hidden / head_dim;
+        else if (head_dim <= 0 && num_heads > 0 && proj_hidden % num_heads == 0)
+            head_dim = proj_hidden / num_heads;
+        if (num_heads <= 0 || head_dim <= 0 || num_heads * head_dim != proj_hidden) return false;
 
-        // Transpose must bring "3" to front; only perm[0]==2 is required.
+        // The [B, S, 3, H, D] projection is unbound into Q, K, V either after a Transpose that
+        // brings "3" to the front (only perm[0]==2 is required; parts are then [B, H, S, D]), or
+        // directly along axis 2 (Hiera/SAM2; parts are [B, S, H, D] and each gets its own
+        // Transpose below).
         Arg reshape_out = prog[reshape_idx]->outputs[0];
         int transpose_idx = singleConsumer(reshape_out);
-        if (!isTranspose(prog, transpose_idx)) return false;
-        TransposeLayer* tr = dynamic_cast<TransposeLayer*>(prog[transpose_idx].get());
-        if (!tr || tr->perm.size() != 5 || tr->perm[0] != 2) return false;
-
-        Arg tr_out = prog[transpose_idx]->outputs[0];
-        auto cit = consumers_.find(tr_out.idx);
+        Arg unbind_src;
+        int unbind_axis;
+        if (isTranspose(prog, transpose_idx)) {
+            TransposeLayer* tr = dynamic_cast<TransposeLayer*>(prog[transpose_idx].get());
+            if (!tr || tr->perm.size() != 5 || tr->perm[0] != 2) return false;
+            unbind_src = prog[transpose_idx]->outputs[0];
+            unbind_axis = 0;
+        } else {
+            transpose_idx = -1;
+            unbind_src = reshape_out;
+            unbind_axis = 2;
+        }
+        auto cit = consumers_.find(unbind_src.idx);
         if (cit == consumers_.end()) return false;
 
-        // Unbind the leading "3" into Q, K, V: three Gathers (index 0, 1, 2), or one Split along
-        // axis 0 followed by a Squeeze of that axis on each part (torch.unbind as newer exporters
-        // write it). unbind_ops are the ops that do it; qkv_out[k] is the [B, H, S, D] result.
+        // Unbind the "3" axis into Q, K, V: three Gathers (index 0, 1, 2, after the Transpose
+        // only), or one Split along that axis followed by a Squeeze of it on each part
+        // (torch.unbind as newer exporters write it). unbind_ops are the ops that do it.
         std::set<int> unbind_ops;
         Arg qkv_out[3];
-        if (cit->second.size() == 3) {
+        if (cit->second.size() == 3 && unbind_axis == 0) {
             int gather_for_idx[3] = { -1, -1, -1 };  // [Q,K,V] = [0,1,2]
             for (int c : cit->second) {
                 if (c < 0 || c >= (int)prog.size() || !prog[c]) return false;
@@ -688,7 +704,9 @@ struct ModelFusionAttention
             const int split_idx = cit->second[0];
             if (split_idx < 0 || split_idx >= (int)prog.size() || !prog[split_idx]) return false;
             Split2Layer* sp = dynamic_cast<Split2Layer*>(prog[split_idx].get());
-            if (!sp || sp->axis != 0 || prog[split_idx]->outputs.size() != 3) return false;
+            if (!sp || (sp->axis != unbind_axis && sp->axis != unbind_axis - 5) ||
+                prog[split_idx]->outputs.size() != 3)
+                return false;
             vector<int> sizes;  // optional split input: one row each
             if (prog[split_idx]->inputs.size() >= 2 && readConstInts(prog[split_idx]->inputs[1], sizes) &&
                 sizes != vector<int>{1, 1, 1})
@@ -703,12 +721,23 @@ struct ModelFusionAttention
                 vector<int> axes;
                 if (prog[sq]->inputs.size() >= 2 && !readConstInts(prog[sq]->inputs[1], axes)) return false;
                 if (axes.empty()) axes = s->axes;
-                if (axes != vector<int>{0}) return false;
+                if (axes.size() != 1 || (axes[0] != unbind_axis && axes[0] != unbind_axis - 5)) return false;
                 unbind_ops.insert(sq);
                 qkv_out[k] = prog[sq]->outputs[0];
             }
         } else {
             return false;
+        }
+        if (unbind_axis == 2) {
+            // [B, S, H, D] parts: Q and V go to [B, H, S, D]; K's own Transpose (checked below)
+            // must give K^T as [B, H, D, S].
+            for (int k : {0, 2}) {
+                const int t = singleConsumer(qkv_out[k]);
+                TransposeLayer* tr = isTranspose(prog, t) ? dynamic_cast<TransposeLayer*>(prog[t].get()) : nullptr;
+                if (!tr || tr->perm != vector<int>{0, 2, 1, 3}) return false;
+                unbind_ops.insert(t);
+                qkv_out[k] = prog[t]->outputs[0];
+            }
         }
 
         Arg q_out = qkv_out[0];
@@ -730,6 +759,9 @@ struct ModelFusionAttention
 
         int k_trans_idx = singleConsumer(k_out);
         if (!isTranspose(prog, k_trans_idx)) return false;
+        if (unbind_axis == 2 &&
+            dynamic_cast<TransposeLayer*>(prog[k_trans_idx].get())->perm != vector<int>{0, 2, 3, 1})
+            return false;
         Arg k_trans_out = prog[k_trans_idx]->outputs[0];
         // K^T goes into QK^T directly, or through its own scale Mul.
         int k_mul_idx = -1;
@@ -748,8 +780,28 @@ struct ModelFusionAttention
             if (in.idx == k_into_qk.idx) { k_connected = true; break; }
         if (!k_connected) return false;
 
-        int softmax_idx = singleConsumer(prog[qk_matmul_idx]->outputs[0]);
-        if (!isSoftmax(prog, softmax_idx)) return false;
+        // Optional additive term on the scores before Softmax: a relative position bias (BEiT,
+        // Swin) or a mask; either way it becomes the layer's mask input.
+        Arg qk_out = prog[qk_matmul_idx]->outputs[0];
+        int softmax_idx = singleConsumer(qk_out);
+        int bias_add_idx = -1;
+        Arg bias_arg;
+        if (!isSoftmax(prog, softmax_idx)) {
+            const int a = softmax_idx;
+            NaryEltwiseLayer* add = a >= 0 && prog[a] ? dynamic_cast<NaryEltwiseLayer*>(prog[a].get()) : nullptr;
+            if (!add || add->op != NaryEltwiseLayer::OPERATION::ADD || prog[a]->inputs.size() != 2) return false;
+            const auto& ain = prog[a]->inputs;
+            const int t = ain[0].idx == qk_out.idx ? 0 : ain[1].idx == qk_out.idx ? 1 : -1;
+            if (t < 0) return false;
+            bias_arg = ain[1 - t];
+            if (netimpl->isConstArg(bias_arg)) {
+                Mat bt = netimpl->argTensor(bias_arg);
+                if (bt.type() != CV_32F || bt.dims > 4) return false;
+            }
+            bias_add_idx = a;
+            softmax_idx = singleConsumer(prog[a]->outputs[0]);
+            if (!isSoftmax(prog, softmax_idx)) return false;
+        }
         std::set<int> cast_ops;
         int av_matmul_idx = skipIdentityCasts(prog, singleConsumer(prog[softmax_idx]->outputs[0]), cast_ops);
         if (!isMatMul(prog, av_matmul_idx)) return false;
@@ -798,16 +850,21 @@ struct ModelFusionAttention
 
         Ptr<LayerInfo> attn_layer = LayerFactory::createLayerInstance(attn_params.type, attn_params);
         CV_Assert(attn_layer);
-        attn_layer->inputs  = { shared_input };
+        if (bias_add_idx >= 0)
+            attn_layer->inputs = { shared_input, bias_arg };
+        else
+            attn_layer->inputs = { shared_input };
         attn_layer->outputs = prog[out_reshape_idx]->outputs;
         attn_layer->netimpl = netimpl;
 
         std::set<int> to_remove = {
-            qkv_matmul_idx, reshape_idx, transpose_idx,
+            qkv_matmul_idx, reshape_idx,
             q_mul_idx, k_trans_idx,
             qk_matmul_idx, softmax_idx,
             av_matmul_idx, out_trans_idx, out_reshape_idx
         };
+        if (transpose_idx >= 0) to_remove.insert(transpose_idx);
+        if (bias_add_idx >= 0) to_remove.insert(bias_add_idx);
         to_remove.insert(unbind_ops.begin(), unbind_ops.end());
         if (k_mul_idx >= 0) to_remove.insert(k_mul_idx);
         if (add_idx >= 0) to_remove.insert(add_idx);
