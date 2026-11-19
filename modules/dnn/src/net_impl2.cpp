@@ -968,6 +968,14 @@ void Net::Impl::forwardMainGraph(InputArrayOfArrays inputs, OutputArrayOfArrays 
 
     forwardGraph(mainGraph, inputs, outputs, true);
 
+    // The first inference grew each buffer to fit whatever landed in it; with every size known
+    // now, re-plan once by size (the way ONNX Runtime plans its arena) if that saves memory.
+    if (replanBuffersBySize()) {
+#ifdef HAVE_CUDA
+        cudaGraphReset();  // buffers were re-planned under the recorded graph
+#endif
+    }
+
     // Feed present.* outputs back as past_key_values.* inputs for the next step (causal-lm-with-past).
     if (useKVCache && kvCacheManager.hasRoutes)
         kvCacheManager.applyRoutes();
