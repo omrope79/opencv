@@ -10,6 +10,14 @@
 #include "gemm_kernels.simd.hpp"
 #include "gemm_sme.hpp"
 
+#if defined(CV_GEMM_HAVE_SME2)
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#elif defined(__linux__)
+#include <sys/auxv.h>
+#endif
+#endif
+
 namespace cv {
 namespace gemm_engine {
 
@@ -41,6 +49,29 @@ bool smeEnabled()
 #endif
 }
 
+// True when the SME2 kernels are built and the CPU has SME2 (OPENCV_CORE_GEMM_SME2=0 turns them off).
+static bool sme2Enabled()
+{
+#if defined(CV_GEMM_HAVE_SME2)
+    static const bool enabled = [] {
+        if (!smeEnabled() || !utils::getConfigurationParameterBool("OPENCV_CORE_GEMM_SME2", true))
+            return false;
+#if defined(__APPLE__)
+        int have = 0;
+        size_t size = sizeof(have);
+        return sysctlbyname("hw.optional.arm.FEAT_SME2", &have, &size, NULL, 0) == 0 && have != 0;
+#elif defined(__linux__) && defined(AT_HWCAP2)
+        return (getauxval(AT_HWCAP2) & (1ULL << 37)) != 0;  // HWCAP2_SME2
+#else
+        return false;
+#endif
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
 int smeVectorLength()
 {
 #if defined(CV_GEMM_HAVE_SME)
@@ -62,6 +93,7 @@ enum
     SME_MIN_M = 8,           // fewer rows waste most of an SME tile
     SME_MIN_MACS = 1 << 18,  // below this the streaming-mode switch and packing dominate
     SME_TASK_MACS = 1 << 21, // smallest SME task
+    SME_TARGET_MACS = 1 << 20, // work per SME task the split aims for (measured on Apple M5)
     SME_KC = 512,            // k block when k and the tiles are large
     SME_BIG = 256
 };
@@ -339,9 +371,14 @@ static void gemmSME(const Problem& P)
     // ZA holds the whole k unless both sides are large, where k blocks keep the panels in cache.
     const int KC = k <= 3 * SME_KC || m < SME_BIG || n < SME_BIG ? k : (int)SME_KC;
     const bool direct = P.B.panelWidth == W;
+    const bool sme2 = sme2Enabled();
 
     const int rowUnits = (m + R - 1) / R, colUnits = (n + colUnit - 1) / colUnit;
-    const int target = P.nthreads > 1 ? 2 * P.nthreads : 1;
+    // The SME units are shared by groups of cores, so tiny tasks only add packing and scheduling;
+    // but in a network B comes from memory, and more tasks read it in parallel. Aim for one task per
+    // SME_TARGET_MACS of work, between 2 and 2 per thread.
+    const double macs = (double)P.batch * m * n * k;
+    const int target = P.nthreads > 1 ? std::max(2, std::min(2 * P.nthreads, cvRound(macs / SME_TARGET_MACS))) : 1;
     int rb = rowUnits, cb = colUnits;
     auto tasks = [&]() { return P.batch * ((rowUnits + rb - 1) / rb) * ((colUnits + cb - 1) / cb); };
     while (tasks() < target && (rb > 1 || cb > 1) && (double)rb * R * cb * colUnit * k >= 2. * SME_TASK_MACS)
@@ -418,7 +455,7 @@ static void gemmSME(const Problem& P)
                     bp = bbuf;
                 }
                 sme::gemmPanels(mc, nc, kc, R, ap, (size_t)R * kc, bp, bStride, P.alpha, beta,
-                                P.C + P.cOfs[b] + i0 * P.ldc + j0, P.ldc);
+                                P.C + P.cOfs[b] + i0 * P.ldc + j0, P.ldc, sme2);
             }
         });
     }
