@@ -363,6 +363,13 @@ class AttentionLayerImpl CV_FINAL : public AttentionLayer {
         qkv_head_sizes[2] = static_cast<size_t>(qkv_hidden_sizes[2] / num_heads);
 
         const auto *weight_data = weight.ptr<const float>();
+        if (wideQKV()) {
+            // The whole [input_hidden, Q|K|V] weight as one slice: one GEMM for every head.
+            engine_wide.pack(weight_data, hidden_size * sizeof(float), (int)hidden_size, (int)input_hidden_size, false);
+            for (int q = 0; q < 3; q++)
+                engine_weight[q].release();
+            return;
+        }
         if (gemmEngineEnabled()) {
             // Engine packs: one slice per head, heads are column blocks of the weight.
             const size_t offsets[3] = {0, qkv_hidden_sizes[0], qkv_hidden_sizes[0] + qkv_hidden_sizes[1]};
@@ -408,7 +415,8 @@ class AttentionLayerImpl CV_FINAL : public AttentionLayer {
     }
 
     bool qkvPacked() const {
-        return !packed_weight_q.empty() || !packed_qkv_mlas.empty() || !engine_weight[0].empty();
+        return !packed_weight_q.empty() || !packed_qkv_mlas.empty() || !engine_weight[0].empty() ||
+               !engine_wide.empty();
     }
 
     // Dynamic weights (blobs empty) aren't available yet; forward() packs those.
@@ -477,7 +485,58 @@ class AttentionLayerImpl CV_FINAL : public AttentionLayer {
         auto *K = Q + batch_size * seq_len * qkv_hidden_sizes[0];
         auto *V = K + batch_size * seq_len * qkv_hidden_sizes[1];
         float *QKV[3] = {Q, K, V}; // [B, N, S, H] per tensor
-        {
+        const bool hasMask = hasMaskInput(inputs.size());
+        FlashAttentionMask mask;
+        if (hasMask && flashAttentionEnabled())
+            resolveMask(inputs, mask);
+        Mat qkv_heads;  // per-head copy of the wide projection, only when flash attention can't run
+        if (!engine_wide.empty()) {
+            // One GEMM over all tokens: wide[t, :] = input[t, :] * W + bias, Q|K|V side by side per token.
+            const auto &bias = blobs.empty() ? inputs[2] : blobs.back();
+            const float *bias_data = bias.ptr<const float>();
+            const float *input_data = inputs[0].ptr<const float>();
+            const int tokens = (int)(batch_size * seq_len);
+            float *wide = gemm_buffer.ptr<float>();
+            parallel_for_(Range(0, tokens), [&](const Range &r) {
+                for (int t = r.start; t < r.end; t++)
+                    std::memcpy(wide + (size_t)t * hidden_size, bias_data, hidden_size * sizeof(float));
+            }, tokens * (double)hidden_size * (1 / 65536.0));
+            engine_wide.gemm(0, input_data, input_hidden_size * sizeof(float), false,
+                             wide, hidden_size * sizeof(float), tokens, 1.f, 1.f, true);
+
+            const size_t S = seq_len, W = hidden_size;
+            const size_t col_ofs[3] = {0, qkv_hidden_sizes[0], qkv_hidden_sizes[0] + qkv_hidden_sizes[1]};
+            if (useFlashAttention(inputs.size(), (int)batch_size, (int)seq_len, (int)qkv_head_sizes[2])) {
+                // Head h of Q is columns [h*D, (h+1)*D) of the Q range; a row step is the full width.
+                const FlashAttentionLayout layout{
+                    S * W, qkv_head_sizes[0], W,
+                    S * W, qkv_head_sizes[1], W,
+                    S * W, qkv_head_sizes[2], W };
+                flashAttention(wide + col_ofs[0], wide + col_ofs[1], wide + col_ofs[2], outputs[0].ptr<float>(),
+                               (int)batch_size, (int)num_heads, (int)seq_len, (int)seq_len,
+                               (int)qkv_head_sizes[0], (int)qkv_head_sizes[2], scale, false,
+                               hasMask ? &mask : nullptr, &layout);
+                return;
+            }
+            // Dense fallback: reshuffle to the [B, H, S, D] per-tensor layout it reads.
+            qkv_heads.create(1, (int)(batch_size * seq_len * hidden_size), CV_32F);
+            Q = qkv_heads.ptr<float>();
+            K = Q + batch_size * seq_len * qkv_hidden_sizes[0];
+            V = K + batch_size * seq_len * qkv_hidden_sizes[1];
+            float *dst[3] = {Q, K, V};
+            const size_t loops = 3 * batch_size * num_heads;
+            parallel_for_(Range(0, (int)loops), [&](const Range &r) {
+                for (int i = r.start; i < r.end; i++) {
+                    const size_t q = i % 3, bh = i / 3, b = bh / num_heads, h = bh % num_heads;
+                    const size_t D = qkv_head_sizes[q];
+                    const float *s = wide + b * S * W + col_ofs[q] + h * D;
+                    float *d = dst[q] + bh * S * D;
+                    for (size_t t = 0; t < S; t++)
+                        std::memcpy(d + t * D, s + t * W, D * sizeof(float));
+                }
+            });
+        }
+        else {
             const auto &input = inputs[0];
             const auto &bias = blobs.empty() ? inputs[2] : blobs.back();
             const auto *input_data = input.ptr<const float>();
@@ -577,10 +636,12 @@ class AttentionLayerImpl CV_FINAL : public AttentionLayer {
             const int Dqk = (int)qkv_head_sizes[0];
             const int Dv  = (int)qkv_head_sizes[2];
             if (flashAttentionEnabled()) {
-                // Arm: flash attention on the core GEMM engine.
-                flashAttention(Q, K, V, outputs[0].ptr<float>(), B, H, S, S, Dqk, Dv, scale);
+                // Arm: flash attention on the core GEMM engine, with the mask applied per score tile.
+                flashAttention(Q, K, V, outputs[0].ptr<float>(), B, H, S, S, Dqk, Dv, scale, false,
+                               hasMask ? &mask : nullptr);
                 return;
             }
+            CV_Assert(!hasMask);  // useFlashAttention() keeps masked layers off MLAS flash attention
             // ORT-style default tiling, clamped to the actual sequence length.
             const int q_block  = std::min(256, S);
             const int kv_block = std::min(256, S);
@@ -628,66 +689,20 @@ class AttentionLayerImpl CV_FINAL : public AttentionLayer {
                           output, (int)seq_len, opt);
 
             // Additive mask broadcast-aligned right to [B,H,S,S] (size-1 dims broadcast); only present when the fusion pass attached an external mask input.
-            int num_non_blob_inputs = (int)inputs.size();
-            bool has_mask = (!blobs.empty() && num_non_blob_inputs >= 2) ||
-                            (blobs.empty() && num_non_blob_inputs >= 4);
-            if (has_mask) {
-                const Mat &mask_mat = blobs.empty() ? inputs[3] : inputs[1];
-                CV_CheckTypeEQ(mask_mat.type(), CV_32F,
-                               "DNN/Attention: mask must be float32");
-
-                const auto mask_shape = shape(mask_mat);
-                const int mask_ndim = mask_shape.dims;
-                auto fmt_shape = [&]() {
-                    std::ostringstream ss;
-                    for (int d = 0; d < mask_ndim; d++) { if (d) ss << ","; ss << mask_shape[d]; }
-                    return ss.str();
-                };
-                // Right-align mask dims to (B, H, Q=S, K=S); missing leading dims default to 1.
-                auto get_dim = [&](int t) -> int {
-                    int md = mask_ndim - 4 + t;
-                    return (md >= 0) ? mask_shape[md] : 1;
-                };
-                // Extra leading dims beyond rank 4 must all be 1 (no broadcasting beyond [B,H,S,S]).
-                for (int d = 0; d < mask_ndim - 4; d++) {
-                    if (mask_shape[d] != 1)
-                        CV_Error(Error::StsNotImplemented,
-                                 cv::format("DNN/Attention: unsupported mask shape [%s] (B=%d, H=%d, S=%d)",
-                                            fmt_shape().c_str(), (int)batch_size, (int)num_heads, (int)seq_len));
-                }
-                const int dim_b = get_dim(0);
-                const int dim_h = get_dim(1);
-                const int dim_q = get_dim(2);
-                const int dim_k = get_dim(3);
-                auto check_bcast = [&](int md, int td, const char* axis) {
-                    if (md != 1 && md != td)
-                        CV_Error(Error::StsNotImplemented,
-                                 cv::format("DNN/Attention: mask shape [%s] not broadcastable to [%d,%d,%d,%d] (axis %s)",
-                                            fmt_shape().c_str(), (int)batch_size, (int)num_heads,
-                                            (int)seq_len, (int)seq_len, axis));
-                };
-                check_bcast(dim_b, (int)batch_size, "batch");
-                check_bcast(dim_h, (int)num_heads, "head");
-                check_bcast(dim_q, (int)seq_len,   "query");
-                check_bcast(dim_k, (int)seq_len,   "key");
-
-                const size_t mask_b_stride = (dim_b == 1) ? 0 : (size_t)dim_h * dim_q * dim_k;
-                const size_t mask_h_stride = (dim_h == 1) ? 0 : (size_t)dim_q * dim_k;
-                const size_t mask_q_stride = (dim_q == 1) ? 0 : (size_t)dim_k;
-                const bool   mask_k_bcast  = (dim_k == 1);
-
-                const float *mask_data = mask_mat.ptr<const float>();
+            if (hasMaskInput(inputs.size())) {
+                FlashAttentionMask mk;
+                resolveMask(inputs, mk);
                 parallel_for_(Range(0, (int)loops), [&](const Range &r) {
                     for (int i = r.start; i < r.end; i++) {
                         const int b = i / (int)num_heads;
                         const int h = i % (int)num_heads;
-                        const float *m_bh = mask_data + b * mask_b_stride + h * mask_h_stride;
+                        const float *m_bh = mk.data + b * mk.sB + h * mk.sH;
                         float *prob = output + i * seq_len_square;
                         for (size_t row = 0; row < seq_len; row++) {
-                            const float *m = m_bh + row * mask_q_stride;
+                            const float *m = m_bh + row * mk.sQ;
                             float *p = prob + row * seq_len;
-                            if (mask_k_bcast) {
-                                float v = m[0];
+                            if (mk.sK == 0) {
+                                const float v = m[0];
                                 for (size_t j = 0; j < seq_len; j++) p[j] += v;
                             } else {
                                 for (size_t j = 0; j < seq_len; j++) p[j] += m[j];
@@ -746,12 +761,70 @@ class AttentionLayerImpl CV_FINAL : public AttentionLayer {
     }
 
  private:
+    bool hasMaskInput(size_t inputCount) const
+    {
+        return (!blobs.empty() && inputCount >= 2) || (blobs.empty() && inputCount >= 4);
+    }
+
+    // The Arm flash kernel takes the mask per score tile; MLAS flash attention has no mask input.
     bool useFlashAttention(size_t inputCount, int batch, int sequence, int valueHeadSize) const
     {
-        const bool hasMask = (!blobs.empty() && inputCount >= 2) ||
-                             (blobs.empty() && inputCount >= 4);
-        return (flashAttentionEnabled() || mlasAvailable()) && !hasMask && batch > 0 && num_heads > 0 &&
+        const bool flash = flashAttentionEnabled() || (mlasAvailable() && !hasMaskInput(inputCount));
+        return flash && batch > 0 && num_heads > 0 &&
                sequence > 0 && qkv_head_sizes[0] > 0 && valueHeadSize > 0;
+    }
+
+    // One packed [input_hidden, Q|K|V] weight and one GEMM for all heads, read in place by the Arm flash
+    // kernel. RoPE rotates each head separately, so it keeps the per-head layout.
+    bool wideQKV() const
+    {
+        return gemmEngineEnabled() && flashAttentionEnabled() && !do_rotary;
+    }
+
+    // Strides of the mask input over [B, H, S, S]: dims right-aligned, size-1 dims broadcast (stride 0).
+    void resolveMask(const std::vector<Mat>& inputs, FlashAttentionMask& mk) const
+    {
+        const Mat &mask_mat = blobs.empty() ? inputs[3] : inputs[1];
+        CV_CheckTypeEQ(mask_mat.type(), CV_32F, "DNN/Attention: mask must be float32");
+        CV_Assert(mask_mat.isContinuous());
+
+        const auto mask_shape = shape(mask_mat);
+        const int mask_ndim = mask_shape.dims;
+        auto fmt_shape = [&]() {
+            std::ostringstream ss;
+            for (int d = 0; d < mask_ndim; d++) { if (d) ss << ","; ss << mask_shape[d]; }
+            return ss.str();
+        };
+        // Right-align mask dims to (B, H, Q=S, K=S); missing leading dims default to 1.
+        auto get_dim = [&](int t) -> int {
+            int md = mask_ndim - 4 + t;
+            return (md >= 0) ? mask_shape[md] : 1;
+        };
+        // Extra leading dims beyond rank 4 must all be 1 (no broadcasting beyond [B,H,S,S]).
+        for (int d = 0; d < mask_ndim - 4; d++) {
+            if (mask_shape[d] != 1)
+                CV_Error(Error::StsNotImplemented,
+                         cv::format("DNN/Attention: unsupported mask shape [%s] (B=%d, H=%d, S=%d)",
+                                    fmt_shape().c_str(), (int)batch_size, (int)num_heads, (int)seq_len));
+        }
+        const int dim_b = get_dim(0), dim_h = get_dim(1), dim_q = get_dim(2), dim_k = get_dim(3);
+        auto check_bcast = [&](int md, int td, const char* axis) {
+            if (md != 1 && md != td)
+                CV_Error(Error::StsNotImplemented,
+                         cv::format("DNN/Attention: mask shape [%s] not broadcastable to [%d,%d,%d,%d] (axis %s)",
+                                    fmt_shape().c_str(), (int)batch_size, (int)num_heads,
+                                    (int)seq_len, (int)seq_len, axis));
+        };
+        check_bcast(dim_b, (int)batch_size, "batch");
+        check_bcast(dim_h, (int)num_heads, "head");
+        check_bcast(dim_q, (int)seq_len,   "query");
+        check_bcast(dim_k, (int)seq_len,   "key");
+
+        mk.data = mask_mat.ptr<const float>();
+        mk.sB = (dim_b == 1) ? 0 : (size_t)dim_h * dim_q * dim_k;
+        mk.sH = (dim_h == 1) ? 0 : (size_t)dim_q * dim_k;
+        mk.sQ = (dim_q == 1) ? 0 : (size_t)dim_k;
+        mk.sK = (dim_k == 1) ? 0 : 1;
     }
 
     size_t num_heads;
@@ -774,6 +847,7 @@ class AttentionLayerImpl CV_FINAL : public AttentionLayer {
     Mat packed_qkv_mlas;  // used instead of packed_weight_q/k/v when MLAS is available
     size_t packed_qkv_ofs[3] = {0, 0, 0}, packed_qkv_step[3] = {0, 0, 0};
     EngineGemmB engine_weight[3];  // Q, K, V projections packed for the core GEMM engine (Arm)
+    EngineGemmB engine_wide;       // or the whole Q|K|V weight as one slice, see wideQKV()
     std::vector<unsigned char> flash_scratch;
 
     FastGemmOpt opt;

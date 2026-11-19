@@ -25,7 +25,8 @@ static LayerParams attentionWorkspaceParams(int valueHidden, bool rotary, Mat& w
 }
 
 // Without a mask the layer streams the scores (flash attention): through MLAS, or on AArch64
-// through the built-in kernel when MLAS is off. Otherwise it keeps the full score matrix.
+// through the built-in kernel when MLAS is off. Otherwise it keeps the full score matrix, except
+// on AArch64 where the built-in kernel (when selected) also takes the mask.
 #if defined(HAVE_MLAS) || defined(__aarch64__) || defined(_M_ARM64)
 #define ATTENTION_FLASH_WORKSPACE 1
 #endif
@@ -59,7 +60,14 @@ TEST_P(Layer_AttentionWorkspace, memoryPlan)
         for (const MatShape& shape : internals)
             elements += total(shape);
 #ifdef ATTENTION_FLASH_WORKSPACE
-        if (!hasMask)
+#if defined(__aarch64__) || defined(_M_ARM64)
+        // Whether the built-in kernel or MLAS is selected depends on the CPU (SME): a masked layer streams
+        // exactly when it plans no score matrix.
+        const bool streams = !hasMask || total(internals[1]) == 1;
+#else
+        const bool streams = !hasMask;
+#endif
+        if (streams)
         {
             // Linear workspace growth, including QKV and optional RoPE.
             EXPECT_LT(elements, size_t(2 * seq * 128));
