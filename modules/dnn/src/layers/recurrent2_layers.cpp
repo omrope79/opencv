@@ -95,6 +95,63 @@ static void lstmCellFp32(float* g, int H, int j0, int nj, float forgetBias,
         h[j] = go[j]*tanhC[j];            // h_t = o_t * tanh(c_t)
 }
 
+// Recurrent weights for batch 1: each gate's H rows padded to a multiple of 16 and stored as
+// 16-row panels laid out [k][16], so the per-step GEMV reads them in order.
+static void packPanels16(const Mat& Wh, int H, std::vector<float>& dst)
+{
+    const int K = Wh.cols, Hp = alignSize(H, 16);
+    dst.assign((size_t)4 * Hp * K, 0.f);
+    for (int r = 0; r < 4 * H; r++)
+    {
+        const int g = r / H, j = r % H;
+        float* p = dst.data() + ((size_t)(g * Hp + j / 16 * 16) * K) + j % 16;
+        const float* w = Wh.ptr<float>(r);
+        for (int k = 0; k < K; k++)
+            p[k * 16] = w[k];
+    }
+}
+
+// dst[r] += W[r] . h for r in [0, nrows), W given as 16-row panels from packPanels16.
+static void gemvPanels16(const float* h, const float* wp, int K, int nrows, float* dst)
+{
+    for (int r = 0; r < nrows; r += 16, wp += (size_t)16 * K)
+    {
+        alignas(16) float out[16];
+#if CV_SIMD128
+        v_float32x4 a0 = v_setzero_f32(), a1 = a0, a2 = a0, a3 = a0, b0 = a0, b1 = a0, b2 = a0, b3 = a0;
+        const float* w = wp;
+        int k = 0;
+        for (; k + 2 <= K; k += 2, w += 32)
+        {
+            const v_float32x4 h0 = v_setall_f32(h[k]), h1 = v_setall_f32(h[k + 1]);
+            a0 = v_fma(v_load(w),      h0, a0); a1 = v_fma(v_load(w + 4),  h0, a1);
+            a2 = v_fma(v_load(w + 8),  h0, a2); a3 = v_fma(v_load(w + 12), h0, a3);
+            b0 = v_fma(v_load(w + 16), h1, b0); b1 = v_fma(v_load(w + 20), h1, b1);
+            b2 = v_fma(v_load(w + 24), h1, b2); b3 = v_fma(v_load(w + 28), h1, b3);
+        }
+        if (k < K)
+        {
+            const v_float32x4 h0 = v_setall_f32(h[k]);
+            a0 = v_fma(v_load(w),      h0, a0); a1 = v_fma(v_load(w + 4),  h0, a1);
+            a2 = v_fma(v_load(w + 8),  h0, a2); a3 = v_fma(v_load(w + 12), h0, a3);
+        }
+        v_store(out,      v_add(a0, b0)); v_store(out + 4,  v_add(a1, b1));
+        v_store(out + 8,  v_add(a2, b2)); v_store(out + 12, v_add(a3, b3));
+#else
+        for (int i = 0; i < 16; i++)
+        {
+            float acc = 0.f;
+            for (int k = 0; k < K; k++)
+                acc += wp[k * 16 + i] * h[k];
+            out[i] = acc;
+        }
+#endif
+        const int n = std::min(16, nrows - r);
+        for (int i = 0; i < n; i++)
+            dst[r + i] += out[i];
+    }
+}
+
 class LSTM2LayerImpl CV_FINAL : public LSTM2Layer
 {
     int seqLenth, batchSize, numHidden;
@@ -126,6 +183,7 @@ class LSTM2LayerImpl CV_FINAL : public LSTM2Layer
     FastGemmOpt gemmOpt;            // MLAS GEMM options for the batched input projection
     std::vector<std::vector<float>> packedWx;  // per-direction prepacked Wx (fp32) for fastGemm
     std::vector<std::vector<float>> packedWh;  // per-direction prepacked Wh (fp32) for the batched recurrent GEMM
+    std::vector<std::vector<float>> panelWh;   // per-direction Wh as 16-row panels for the batch-1 recurrence
 #ifdef HAVE_MLAS
     std::vector<Mat> packedWxMlas;  // per-direction MLAS-packed Wx; preferred over packedWx when present
 #endif
@@ -350,7 +408,10 @@ class LSTM2LayerImpl CV_FINAL : public LSTM2Layer
                                  const Mat& c0All, Mat& hOutAll, Mat& cOut) const
         {
             const int H = numHidden, T = seqLenth;
-            const int chunk = ((H + chunksPerDir - 1) / chunksPerDir + 7) & ~7;  // multiple of fastGEMM1T's 8-row block
+            const bool panels = !panelWh.empty();
+            // whole 16-row panels, or fastGEMM1T's 8-row blocks
+            const int chunk = alignSize((H + chunksPerDir - 1) / chunksPerDir, panels ? 16 : 8);
+            const int Hp = alignSize(H, 16), K = weightBlobs[1].cols;
             const int ntasks = numDirs * chunksPerDir;
             Mat cState = c0All.clone();                                 // numDirs x H, each task updates its own slice
             Mat cOutRows = produceCellOutput ? cOut.reshape(1, T) : Mat();  // T x (numDirs*H)
@@ -370,10 +431,19 @@ class LSTM2LayerImpl CV_FINAL : public LSTM2Layer
                         const int ts = rev ? T - 1 - t : t;
                         // h_{t-1} is the previous step's row of hOutAll, complete since the last parallel_for_ returned
                         const float* hPrev = t == 0 ? h0All.ptr<float>(d) : hOutAll.ptr<float>(rev ? ts + 1 : ts - 1) + d*H;
-                        Mat Wh = weightBlobs[1].rowRange(d * 4*H, (d + 1) * 4*H);
                         float* g = gatesAll[d].ptr<float>(ts);
-                        for (int k = 0; k < 4; k++)
-                            recurrentGemv(hPrev, Wh, k*H + j0, nj, g + k*H + j0);
+                        if (panels)
+                        {
+                            for (int k = 0; k < 4; k++)
+                                gemvPanels16(hPrev, panelWh[d].data() + (size_t)(k*Hp + j0) * K, K, nj,
+                                             g + k*H + j0);
+                        }
+                        else
+                        {
+                            Mat Wh = weightBlobs[1].rowRange(d * 4*H, (d + 1) * 4*H);
+                            for (int k = 0; k < 4; k++)
+                                recurrentGemv(hPrev, Wh, k*H + j0, nj, g + k*H + j0);
+                        }
 
                         lstmCellFp32(g, H, j0, nj, forgetBias, sigmoidFn, tanhFn,
                                      cState.ptr<float>(d) + j0, hOutAll.ptr<float>(ts) + d*H + j0, tanhC.data());
@@ -446,6 +516,13 @@ class LSTM2LayerImpl CV_FINAL : public LSTM2Layer
                     opt.multi_thread = parallelInside;
                     fastGemm(false, batchSize, Wh.rows, Wh.cols, 1.f, hInternal.ptr<float>(), Wh.cols,
                              packedWh[i].data(), 1.f, gates.ptr<float>(), Wh.rows, opt);
+                }
+                else if (dtype == CV_32F && batchSize == 1 && (int)panelWh.size() == numDirs)
+                {
+                    const int H = numHidden, Hp = alignSize(H, 16);
+                    for (int k = 0; k < 4; k++)
+                        gemvPanels16(hInternal.ptr<float>(), panelWh[i].data() + (size_t)k * Hp * Wh.cols,
+                                     Wh.cols, H, gates.ptr<float>() + k * H);
                 }
                 else if (dtype == CV_32F)
                 {
@@ -617,9 +694,22 @@ class LSTM2LayerImpl CV_FINAL : public LSTM2Layer
             const bool fp32 = input[0].type() == CV_32F && h0All.isContinuous() && c0All.isContinuous();
             const bool fastGates = fp32 && defaultActivations && !usePeephole && !useCellClip;
 
-            // Batch 1 with enough hidden units: split each direction across threads at every timestep.
+            // Batch 1 where fastGEMM1T would run its NEON version: Wh as 16-row panels, packed once
+            // (packWeights clears them when the weights change). x86 and SVE keep fastGEMM1T.
+            const bool panels = fp32 && batchSize == 1 && useNEON && !useSVE;
+            if (panels && panelWh.empty())
+            {
+                const int N = weightBlobs[1].rows / numDirs;   // 4 * numHidden
+                panelWh.resize(numDirs);
+                for (int d = 0; d < numDirs; d++)
+                    packPanels16(weightBlobs[1].rowRange(d * N, (d + 1) * N), numHidden, panelWh[d]);
+            }
+            // With panels a step is split across threads only when it is large enough
+            // (>= 1M multiply-adds) to pay for one parallel_for_ per step.
+            const bool splitSteps = panels ? (int64)4 * numHidden * weightBlobs[1].cols >= (1 << 20)
+                                           : numHidden >= 128;
             int chunksPerDir = 1;
-            if (fastGates && batchSize == 1 && numHidden >= 128)
+            if (fastGates && batchSize == 1 && splitSteps)
                 chunksPerDir = std::min(numHidden / 64, std::max(1, std::min(getNumThreads(), 8) / numDirs));
             if (chunksPerDir >= 2)
                 forwardStepParallel(numDirs, chunksPerDir, gatesAll, h0All, c0All, hOutAll, cOut);
@@ -805,6 +895,7 @@ class LSTM2LayerImpl CV_FINAL : public LSTM2Layer
             // Prepack Wx per direction (fp32) so the projection is one batched GEMM; MLAS when available.
             packedWx.clear();
             packedWh.clear();   // packed on demand in forward() for batches > 1
+            panelWh.clear();
 #ifdef HAVE_MLAS
             packedWxMlas.clear();
 #endif
