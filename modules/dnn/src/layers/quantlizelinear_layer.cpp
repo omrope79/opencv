@@ -8,6 +8,7 @@
 #include "../net_impl.hpp"
 #include "../onnx/onnx_dtype_convert.hpp"
 
+#include "opencv2/core/hal/intrin.hpp"
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
@@ -77,6 +78,55 @@ static void quantizeLinearFast_f32_avx2(const float* inp, _OutTp* out,
 }
 #endif
 
+#if !(defined(__x86_64__) || defined(_M_X64)) && (CV_SIMD || CV_SIMD_SCALABLE)
+// Per-tensor float -> uint8/int8 with universal intrinsics; same math and clamping as the AVX2 path.
+template <typename _OutTp>
+static void quantizeLinearChunk_f32_simd(const float* src, _OutTp* dst, float scale, int zp_i,
+                                         int lo_i, int hi_i, int64_t len)
+{
+    const float flo = (float)(lo_i - zp_i), fhi = (float)(hi_i - zp_i);
+    const int VL = VTraits<v_float32>::vlanes();
+    const v_float32 vscale = vx_setall_f32(scale), vlo = vx_setall_f32(flo), vhi = vx_setall_f32(fhi);
+    const v_int32 vzp = vx_setall_s32(zp_i);
+    int64_t j = 0;
+    for (; j <= len - 4 * VL; j += 4 * VL) {
+        v_int32 r[4];
+        for (int k = 0; k < 4; k++) {
+            v_float32 v = v_div(vx_load(src + j + k * VL), vscale);
+            // compares, not max/min, so a NaN lands on the low bound as in the scalar loop
+            v = v_select(v_gt(v, vlo), v, vlo);
+            v = v_select(v_lt(v, vhi), v, vhi);
+            r[k] = v_add(v_round(v), vzp);   // round before adding the zero point
+        }
+        v_int16 p0 = v_pack(r[0], r[1]), p1 = v_pack(r[2], r[3]);
+        if (std::is_signed<_OutTp>::value)
+            v_store((schar*)(dst + j), v_pack(p0, p1));
+        else
+            v_store((uchar*)(dst + j), v_pack_u(p0, p1));
+    }
+    for (; j < len; j++) {
+        float v = src[j] / scale;
+        v = v > flo ? v : flo;
+        v = v < fhi ? v : fhi;
+        dst[j] = (_OutTp)(cvRound(v) + zp_i);
+    }
+}
+
+template <typename _OutTp>
+static void quantizeLinearFast_f32_simd(const float* inp, _OutTp* out, float scale, int zp_i,
+                                        int lo_i, int hi_i, int64_t total)
+{
+    // 64k elements per stripe: one stripe per 1k elements costs more in dispatch than the work
+    const int64_t block = 1 << 16;
+    const int64_t nblocks = (total + block - 1) / block;
+    parallel_for_(Range(0, (int)nblocks), [&](const Range& r) {
+        for (int i = r.start; i < r.end; i++) {
+            int64_t ofs = i * block;
+            quantizeLinearChunk_f32_simd(inp + ofs, out + ofs, scale, zp_i, lo_i, hi_i, std::min(block, total - ofs));
+        }
+    });
+}
+#endif
 
 /*
     QuantizeLinear layer, as defined in ONNX specification:
@@ -323,6 +373,20 @@ static void quantizeLinear(const Mat& inp, const Mat& scale_, const Mat& zp,
                                         reinterpret_cast<int8_t*>(out.data),
                                         scale_f32, zp_i, int4Out ? -8 : -128, int4Out ? 7 : 127, total);
         }
+        return;
+    }
+#elif (CV_SIMD || CV_SIMD_SCALABLE)
+    if (block_size == 0 && sz_a == 1 && inptype == CV_32F && sctype == CV_32F
+        && (outtype == CV_8U || outtype == CV_8S)) {
+        float scale_f32 = reinterpret_cast<const float*>(scale.data)[0];
+        int64_t total = nslices * slice_size;
+        if (outtype == CV_8U)
+            quantizeLinearFast_f32_simd(reinterpret_cast<const float*>(inp.data), reinterpret_cast<uint8_t*>(out.data),
+                                        scale_f32, zp.empty() ? 0 : (int)zp.ptr<uint8_t>()[0], 0, int4Out ? 15 : 255, total);
+        else
+            quantizeLinearFast_f32_simd(reinterpret_cast<const float*>(inp.data), reinterpret_cast<int8_t*>(out.data),
+                                        scale_f32, zp.empty() ? 0 : (int)zp.ptr<int8_t>()[0],
+                                        int4Out ? -8 : -128, int4Out ? 7 : 127, total);
         return;
     }
 #endif
