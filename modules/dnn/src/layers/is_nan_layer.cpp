@@ -27,7 +27,7 @@ static inline void computeIsNaNMask(const T* src, uchar* dst, const size_t count
             WT v = (WT)src[i];
             dst[i] = static_cast<uchar>(cvIsNaN(v));
         }
-    });
+    }, (double)count / 65536);
 }
 
 class IsNaNLayerImpl CV_FINAL : public IsNaNLayer

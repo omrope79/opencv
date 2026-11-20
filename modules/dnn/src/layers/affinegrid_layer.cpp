@@ -58,7 +58,7 @@ void computeGrid2D(const Mat& theta, Mat& grid, int N, int H, int W,
                 out[2*x + 1] = T1_0*nx + base1;
             }
         }
-    });
+    }, (double)total * W / 65536);
 }
 
 template<typename T>
@@ -114,7 +114,7 @@ void computeGrid3D(const Mat& theta, Mat& grid, int N, int D, int H, int W,
                 out[o + 2] = T2_0*nx + base2;
             }
         }
-    });
+    }, (double)total * W / 65536);
 }
 }
 

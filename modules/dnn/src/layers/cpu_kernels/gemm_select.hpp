@@ -33,6 +33,8 @@ public:
     // C = alpha*op(A)*B_i + beta*C for slice i.
     void gemm(int i, const float* A, size_t A_step, bool transA, float* C, size_t C_step, int M,
               float alpha, float beta, bool multiThread) const;
+    // Packed slice i as written by cv::hal::gemm32fPackB.
+    const void* data(int i) const { return buf.data + i * stride; }
 
     int n = 0, k = 0, count = 0;
 private:

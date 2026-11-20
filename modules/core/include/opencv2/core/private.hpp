@@ -158,6 +158,15 @@ namespace hal {
 //! True when cv::hal::gemm32fPacked and gemm32fBatch run on the Arm SME units of this CPU; dnn uses it to pick
 //! between them and MLAS.
 CV_EXPORTS bool gemm32fUsesSME();
+
+//! Rows per A panel for gemm32fPanelsA (2 SME vectors), or 0 when SME is not used.
+CV_EXPORTS int gemm32fPanelRowsA();
+
+//! C = A*B + beta*C on the calling thread for columns [j0, j0+nc) of B. A is already in panels of
+//! gemm32fPanelRowsA() rows, each k x rows; B was packed by gemm32fPackB. C points at column j0.
+//! Returns false (and computes nothing) when B is not in SME panels.
+CV_EXPORTS bool gemm32fPanelsA(const float* Apanels, int m, const void* packedB, int j0, int nc,
+                               float* C, size_t C_step, float beta);
 }
 
 } // namespace

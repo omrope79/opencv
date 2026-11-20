@@ -403,6 +403,10 @@ elseif(ARM OR AARCH64)
     if(NOT MSVC)
       ocv_update(CPU_SME_FLAGS_ON "-march=armv8.6-a+sme")
       ocv_check_compiler_flag(CXX "${CPU_SME_FLAGS_ON}" HAVE_SME_INTRINSICS "${OpenCV_SOURCE_DIR}/cmake/checks/cpu_sme.cpp")
+      # SME2 kernels are selected per function (target attribute) and at run time, so the flags stay the same.
+      if(HAVE_SME_INTRINSICS)
+        ocv_check_compiler_flag(CXX "${CPU_SME_FLAGS_ON}" HAVE_SME2_INTRINSICS "${OpenCV_SOURCE_DIR}/cmake/checks/cpu_sme2.cpp")
+      endif()
     endif()
   endif()
 

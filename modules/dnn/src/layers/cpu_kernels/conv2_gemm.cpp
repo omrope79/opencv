@@ -91,6 +91,66 @@ static void im2colNCHWc8(const float* inp, int C1, int H, int W, int Cin,
     }
 }
 
+// im2col for output pixels [p0, p0+M) written straight into SME A panels: R rows per panel,
+// each Kdim x R (row index fastest). Rows past M and padded taps are zero.
+static void im2colPanels(const float* inp, int C1, int H, int W, int Cin,
+                         int Wo, int kh, int kw, int sy, int sx, int dy, int dx,
+                         int pt, int pl, int p0, int M, int R, int q0, int q1, float* A, int Kdim)
+{
+    const size_t plane = (size_t)H * W * 8;
+    AutoBuffer<int> pos((size_t)R * 2);
+    int* iy0 = pos.data();
+    int* ix0 = iy0 + R;
+    const v_float32x4 z = v_setzero_f32();
+    for (int q = q0; q < q1; q++) {
+        float* P = A + (size_t)q * R * Kdim;
+        const int rows = std::min(R, M - q * R);
+        for (int r = 0; r < R; r++) {
+            const int p = p0 + q * R + std::min(r, rows - 1);
+            const int y = p / Wo, x = p - y * Wo;
+            iy0[r] = y * sy - pt;
+            ix0[r] = x * sx - pl;
+        }
+        for (int ky = 0; ky < kh; ky++) {
+            for (int kx = 0; kx < kw; kx++) {
+                float* dtap = P + (size_t)(ky * kw + kx) * Cin * R;
+                for (int r = 0; r < R; r += 4) {
+                    const float* src[4];
+                    for (int j = 0; j < 4; j++) {
+                        const int iy = iy0[r + j] + ky * dy, ix = ix0[r + j] + kx * dx;
+                        src[j] = r + j < rows && (unsigned)iy < (unsigned)H && (unsigned)ix < (unsigned)W ?
+                                 inp + ((size_t)iy * W + ix) * 8 : nullptr;
+                    }
+                    for (int c1 = 0; c1 < C1; c1++) {
+                        // 4 pixels x 8 channels, transposed to 8 rows of 4 pixels.
+                        v_float32x4 lo[4], hi[4];
+                        for (int j = 0; j < 4; j++) {
+                            const float* s = src[j] ? src[j] + c1 * plane : nullptr;
+                            lo[j] = s ? v_load(s) : z;
+                            hi[j] = s ? v_load(s + 4) : z;
+                        }
+                        v_transpose4x4(lo[0], lo[1], lo[2], lo[3], lo[0], lo[1], lo[2], lo[3]);
+                        v_transpose4x4(hi[0], hi[1], hi[2], hi[3], hi[0], hi[1], hi[2], hi[3]);
+                        float* d = dtap + (size_t)c1 * 8 * R + r;
+                        const int nch = std::min(8, Cin - c1 * 8);
+                        for (int c = 0; c < nch; c++)
+                            v_store(d + (size_t)c * R, c < 4 ? lo[c] : hi[c - 4]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Scratch kept per thread between calls, so large buffers are not handed back to the OS every time.
+static float* threadScratch(size_t n)
+{
+    static thread_local std::vector<float> buf;
+    if (buf.size() < n)
+        buf.resize(n);
+    return buf.data();
+}
+
 namespace {
 
 // Output step, same as the Conv2 kernels (setupActivation/fillCoeffBufs in conv2_common.hpp).
@@ -186,19 +246,25 @@ void conv2GemmForward(const Mat& inp, Mat& out, const float* residual, const Con
     const size_t inpStride = (size_t)C1 * H * W * 8;
     const size_t outStride = (size_t)K1 * HWo * 8;
 
+    // SME: im2col writes the A panels the SME kernel reads, so A is not packed a second time.
+    const int R = hal::gemm32fPanelRowsA();
+    const bool panels = R > 0 && hal::gemm32fPanelsA(nullptr, 0, packed.data(0), 0, 0, nullptr, 0, 0.f);
+    const int rowUnit = panels ? R : 32;
+
     // Many output pixels: each thread does im2col + GEMM + output for its own block of rows.
-    // Blocks are a multiple of 32 rows and small enough to stay in L2.
+    // Blocks are a multiple of 32 rows (R with SME) and small enough to stay in L2.
     const size_t segBudget = (size_t)512 << 10;
-    int seg = (int)std::max<size_t>(32, segBudget / ((size_t)Kdim * sizeof(float)));
-    seg = std::min(seg, 256) & ~31;
-    seg = std::max(seg, 32);
+    int seg = (int)std::max<size_t>(rowUnit, segBudget / ((size_t)Kdim * sizeof(float)));
+    seg = std::min(seg, 256) / rowUnit * rowUnit;
+    seg = std::max(seg, rowUnit);
     const int nseg = (HWo + seg - 1) / seg;
 
     if ((int64_t)N * nseg >= nthreads) {
         const int ntasks = N * nseg;
         parallel_for_(Range(0, ntasks), [&](const Range& r) {
             // Not zero-filled: im2col and the GEMM write every element that is read.
-            AutoBuffer<float> Abuf((size_t)seg * Kdim), Cbuf((size_t)seg * Cout);
+            float* Abuf = threadScratch((size_t)seg * Kdim + (size_t)seg * Cout);
+            float* Cbuf = Abuf + (size_t)seg * Kdim;
             for (int t = r.start; t < r.end; t++) {
                 const int n = t / nseg, si = t - n * nseg;
                 const int p0 = si * seg, M = std::min(seg, HWo - p0);
@@ -206,13 +272,19 @@ void conv2GemmForward(const Mat& inp, Mat& out, const float* residual, const Con
                 float* out_n = out.ptr<float>() + n * outStride;
                 const float* res_n = residual ? residual + n * outStride : nullptr;
 
-                im2colNCHWc8(inp_n, C1, H, W, Cin, Wo, kh, kw, sy, sx, dy, dx,
-                             pt, pl, p0, 0, M, Abuf.data(), Kdim);
-                packed.gemm(0, Abuf.data(), (size_t)Kdim * sizeof(float), false, Cbuf.data(),
-                            (size_t)Cout * sizeof(float), M, 1.f, 0.f, false);
+                if (panels) {
+                    im2colPanels(inp_n, C1, H, W, Cin, Wo, kh, kw, sy, sx, dy, dx,
+                                 pt, pl, p0, M, R, 0, (M + R - 1) / R, Abuf, Kdim);
+                    hal::gemm32fPanelsA(Abuf, M, packed.data(0), 0, Cout, Cbuf, (size_t)Cout * sizeof(float), 0.f);
+                } else {
+                    im2colNCHWc8(inp_n, C1, H, W, Cin, Wo, kh, kw, sy, sx, dy, dx,
+                                 pt, pl, p0, 0, M, Abuf, Kdim);
+                    packed.gemm(0, Abuf, (size_t)Kdim * sizeof(float), false, Cbuf,
+                                (size_t)Cout * sizeof(float), M, 1.f, 0.f, false);
+                }
                 for (int k1 = 0; k1 < K1; k1++) {
                     const size_t ofs = ((size_t)k1 * HWo + p0) * 8;
-                    ep.run(Cbuf.data(), k1, 0, M, out_n + ofs, res_n ? res_n + ofs : nullptr);
+                    ep.run(Cbuf, k1, 0, M, out_n + ofs, res_n ? res_n + ofs : nullptr);
                 }
             }
         }, N * nseg);
@@ -223,8 +295,9 @@ void conv2GemmForward(const Mat& inp, Mat& out, const float* residual, const Con
     const size_t budget = (size_t)4 << 20;
     const int chunk = (int)std::min<size_t>((size_t)HWo,
                           std::max<size_t>(64, budget / ((size_t)Kdim * sizeof(float))));
-    if ((size_t)scratchA.total() < (size_t)chunk * Kdim)
-        scratchA.create(1, chunk * Kdim, CV_32F);
+    const size_t aRows = panels ? (size_t)(chunk + R - 1) / R * R : (size_t)chunk;
+    if ((size_t)scratchA.total() < aRows * Kdim)
+        scratchA.create(1, (int)(aRows * Kdim), CV_32F);
     if ((size_t)scratchC.total() < (size_t)chunk * Cout)
         scratchC.create(1, chunk * Cout, CV_32F);
     float* A = scratchA.ptr<float>();
@@ -234,6 +307,41 @@ void conv2GemmForward(const Mat& inp, Mat& out, const float* residual, const Con
         const float* inp_n = inp.ptr<float>() + n * inpStride;
         float* out_n = out.ptr<float>() + n * outStride;
         const float* res_n = residual ? residual + n * outStride : nullptr;
+
+        if (panels) {
+            // Few pixels, wide output: tasks split rows and columns of C into R x R tiles, and each
+            // task writes its own output blocks right after its GEMM.
+            for (int p0 = 0; p0 < HWo; p0 += chunk) {
+                const int M = std::min(chunk, HWo - p0);
+                const int aPanels = (M + R - 1) / R, bPanels = (Cout + R - 1) / R;
+                parallel_for_(Range(0, aPanels), [&](const Range& r) {
+                    im2colPanels(inp_n, C1, H, W, Cin, Wo, kh, kw, sy, sx, dy, dx,
+                                 pt, pl, p0, M, R, r.start, r.end, A, Kdim);
+                }, (double)M * Kdim / 65536);
+
+                // About 2 tasks per thread, none below ~2M multiply-adds.
+                int rb = aPanels, cb = bPanels;
+                auto tasks = [&]() { return ((aPanels + rb - 1) / rb) * ((bPanels + cb - 1) / cb); };
+                while (tasks() < 2 * nthreads && (rb > 1 || cb > 1) && (double)rb * cb * R * R * Kdim >= (4 << 20)) {
+                    if ((rb >= cb && rb > 1) || cb == 1) rb = (rb + 1) / 2;
+                    else cb = (cb + 1) / 2;
+                }
+                const int tM = (aPanels + rb - 1) / rb, tN = (bPanels + cb - 1) / cb;
+                parallel_for_(Range(0, tM * tN), [&](const Range& r) {
+                    for (int t = r.start; t < r.end; t++) {
+                        const int i0 = t / tN * rb * R, j0 = t % tN * cb * R;
+                        const int mc = std::min(rb * R, M - i0), nc = std::min(cb * R, Cout - j0);
+                        hal::gemm32fPanelsA(A + (size_t)i0 * Kdim, mc, packed.data(0), j0, nc,
+                                            C + (size_t)i0 * Cout + j0, (size_t)Cout * sizeof(float), 0.f);
+                        for (int k1 = j0 / 8; k1 < (j0 + nc + 7) / 8; k1++) {
+                            const size_t ofs = ((size_t)k1 * HWo + p0) * 8;
+                            ep.run(C, k1, i0, i0 + mc, out_n + ofs, res_n ? res_n + ofs : nullptr);
+                        }
+                    }
+                }, tM * tN);
+            }
+            continue;
+        }
 
         for (int p0 = 0; p0 < HWo; p0 += chunk) {
             const int M = std::min(chunk, HWo - p0);

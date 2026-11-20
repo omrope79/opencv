@@ -9,6 +9,7 @@
 #include "layers_common.hpp"
 #include "conv2_common.hpp"
 #include "cpu_kernels/mlas_gemm.hpp"
+#include "cpu_kernels/gemm_select.hpp"
 #include "opencv2/core/hal/intrin.hpp"
 #include <opencv2/core/utils/configuration.private.hpp>
 
@@ -112,7 +113,7 @@ public:
             wfloat = rawWeights;
         packGemmWeights(wfloat, C0);
         weights.release();
-        if (gemmWeights.empty())
+        if (gemmWeights.empty() && engineWeights.empty())
             repackDeconvWeights(wfloat, weights, CV_32F, ngroups, C0);
 
         if (!rawBias.empty())
@@ -124,13 +125,16 @@ public:
     void packGemmWeights(const Mat& w, int C0)
     {
         gemmWeights.release();
+        engineWeights.clear();
         gemmCg = gemmKg = gemmKgp = gemmKC = gemmChunks = gemmKsize = gemmC0 = 0;
         gemmChunkStep = 0;
         // CI's Deconvolution tests all take this path on an MLAS build; flip to false to
         // exercise the fallback deconvBlock32f kernel instead.
         static const bool useGemm =
             utils::getConfigurationParameterBool("OPENCV_DNN_CONVTRANSPOSE_GEMM", true);
-        if (!useGemm || !mlasAvailable() || !w.isContinuous() || w.type() != CV_32F ||
+        // Without MLAS the same GEMM runs on the core GEMM engine (AArch64).
+        const bool engine = !mlasAvailable() && gemmEngineEnabled();
+        if (!useGemm || !(mlasAvailable() || engine) || !w.isContinuous() || w.type() != CV_32F ||
             w.dims < 3 || w.size[0] % ngroups != 0 || C0 % 4 != 0)
             return;
         const int Kg = w.size[1], Cg = w.size[0] / ngroups;
@@ -144,10 +148,13 @@ public:
                        std::min(Kgp, (int)alignSize((128 + ksize - 1) / ksize, C0));
         const int nchunks = (Kgp + KC - 1) / KC;
 
-        const size_t step = alignSize(mlasSgemmPackBSize(false, false, ksize * KC, Cg), 64);
-        if (step == 0 || step * ngroups * nchunks > (size_t)INT_MAX)
+        const size_t step = engine ? 0 : alignSize(mlasSgemmPackBSize(false, false, ksize * KC, Cg), 64);
+        if (!engine && (step == 0 || step * ngroups * nchunks > (size_t)INT_MAX))
             return;
-        gemmWeights.create(1, (int)(step * ngroups * nchunks), CV_8U);
+        if (engine)
+            engineWeights.resize((size_t)ngroups * nchunks);
+        else
+            gemmWeights.create(1, (int)(step * ngroups * nchunks), CV_8U);
 
         Mat B(Cg, ksize * KC, CV_32F);
         const float* wdata = w.ptr<float>();
@@ -162,6 +169,10 @@ public:
                         for (int t = 0; t < ksize; t++)
                             brow[t * kn + k] = wk[t];
                     }
+                }
+                if (engine) {
+                    engineWeights[g * nchunks + ch].pack(B.ptr<float>(), B.step[0], ksize * kn, Cg, false);
+                    continue;
                 }
                 if (!mlasSgemmPackB(false, false, ksize * kn, Cg, B.ptr<float>(), ksize * KC,
                                     gemmWeights.data + step * (g * nchunks + ch))) {
@@ -182,7 +193,7 @@ public:
 
     bool gemmCoversShape(const MatShape& inpshape, const MatShape& outshape) const
     {
-        return !gemmWeights.empty() && inpshape.back() == gemmC0 && outshape.back() == gemmC0 &&
+        return (!gemmWeights.empty() || !engineWeights.empty()) && inpshape.back() == gemmC0 && outshape.back() == gemmC0 &&
                inpshape.C == gemmCg * ngroups && outshape.C == gemmKg * ngroups;
     }
 
@@ -344,10 +355,15 @@ public:
                         }
                     }
 
-                    bool ok = mlasSgemmPacked(false, false, M, ncols, Cg, 1.f, A, Cg,
-                                              gemmWeights.data + gemmChunkStep * (g * nchunks + ch),
-                                              0.f, Cm, ncols);
-                    CV_Assert(ok);
+                    if (!engineWeights.empty()) {
+                        engineWeights[g * nchunks + ch].gemm(0, A, (size_t)Cg * sizeof(float), false,
+                                                             Cm, (size_t)ncols * sizeof(float), M, 1.f, 0.f, false);
+                    } else {
+                        bool ok = mlasSgemmPacked(false, false, M, ncols, Cg, 1.f, A, Cg,
+                                                  gemmWeights.data + gemmChunkStep * (g * nchunks + ch),
+                                                  0.f, Cm, ncols);
+                        CV_Assert(ok);
+                    }
 
                     // col2im: add each (pixel, tap) row of Cm to the output pixel it lands on.
                     auto emit = [&](int opos, const float* src) {
@@ -508,7 +524,7 @@ public:
             if (!netimpl_->isConstArg(inputs[i]))
                 dynamicWeights = true;
         }
-        if (dynamicWeights || (weights.empty() && gemmWeights.empty())) {
+        if (dynamicWeights || (weights.empty() && gemmWeights.empty() && engineWeights.empty())) {
             setWeights(input_arrs.getMat(1), ninputs > 2 ? input_arrs.getMat(2) : Mat(),
                        inpshape.back(), netimpl_->accuracy);
         }
@@ -588,6 +604,7 @@ public:
         if (dynamicWeights) {
             weights.release();
             gemmWeights.release();
+            engineWeights.clear();
         }
     }
 
@@ -595,6 +612,7 @@ public:
     std::vector<int> explicit_out_shape;
     Mat weights, bias;
     Mat gemmWeights;  // MLAS-packed B per (group, channel chunk), empty without MLAS
+    std::vector<EngineGemmB> engineWeights;  // the same B for the core GEMM engine when MLAS is off
     size_t gemmChunkStep = 0;
     int gemmCg = 0, gemmKg = 0, gemmKgp = 0, gemmKC = 0, gemmChunks = 0, gemmKsize = 0, gemmC0 = 0;
     MatShape wshape0, prevInpshape;

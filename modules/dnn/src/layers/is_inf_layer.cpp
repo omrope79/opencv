@@ -29,7 +29,7 @@ static inline void computeIsInfMask(const T* src, uchar* dst, const size_t count
                 WT v = (WT)src[i];
                 dst[i] = static_cast<uchar>(cvIsInf(v));
             }
-        });
+        }, (double)count / 65536);
     }
     else if (detectPositive)
     {
@@ -39,7 +39,7 @@ static inline void computeIsInfMask(const T* src, uchar* dst, const size_t count
                 WT v = (WT)src[i];
                 dst[i] = static_cast<uchar>(cvIsInf(v) && (v > 0));
             }
-        });
+        }, (double)count / 65536);
     }
     else if (detectNegative)
     {
@@ -49,7 +49,7 @@ static inline void computeIsInfMask(const T* src, uchar* dst, const size_t count
                 WT v = (WT)src[i];
                 dst[i] = static_cast<uchar>(cvIsInf(v) && (v < 0));
             }
-        });
+        }, (double)count / 65536);
     }
     else
     {

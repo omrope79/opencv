@@ -279,7 +279,7 @@ private:
                         }
                     }
                 }
-            });
+            }, (double)order.size() * sliceElems / 65536);
         }
 
         if (outs.size() > 1) {

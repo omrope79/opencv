@@ -77,10 +77,51 @@ static void scaleRow(const float* src, float* dst, int n, float a)
         dst[j] = src[j] * a;
 }
 
+// dst += a for n values.
+static void addScalar(float* dst, int n, float a)
+{
+    int j = 0;
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+    const int nl = VTraits<v_float32>::vlanes();
+    const v_float32 va = vx_setall_f32(a);
+    for (; j <= n - nl; j += nl)
+        vx_store(dst + j, v_add(vx_load(dst + j), va));
+#endif
+    for (; j < n; j++)
+        dst[j] += a;
+}
+
+// Adds the mask to the score tile St (kn x qn, St[j*qn + i] is query q0+i against key j0+j).
+static void addMaskTile(float* St, const float* mbh, const FlashAttentionMask& mk, int q0, int qn, int j0, int kn)
+{
+    if (mk.sQ == 0)
+    {
+        // One value per key for all queries ([B, 1, 1, S] and the like): one add per tile row.
+        for (int j = 0; j < kn; j++)
+            addScalar(St + (size_t)j * qn, qn, mbh[(size_t)(j0 + j) * mk.sK]);
+        return;
+    }
+    for (int j = 0; j < kn; j++)
+    {
+        float* s = St + (size_t)j * qn;
+        const float* m = mbh + (size_t)(j0 + j) * mk.sK + (size_t)q0 * mk.sQ;
+        for (int i = 0; i < qn; i++)
+            s[i] += m[(size_t)i * mk.sQ];
+    }
+}
+
 void flashAttention(const float* Q, const float* K, const float* V, float* out,
-                    int B, int H, int Sq, int Skv, int D, int Dv, float scale, bool kTransposed)
+                    int B, int H, int Sq, int Skv, int D, int Dv, float scale, bool kTransposed,
+                    const FlashAttentionMask* mask, const FlashAttentionLayout* layout)
 {
     CV_Assert(Q && K && V && out && B > 0 && H > 0 && Sq > 0 && Skv > 0 && D > 0 && Dv > 0);
+    CV_Assert(!(layout && kTransposed));
+    CV_Assert(!mask || mask->data);
+    // Element strides of Q, K, V over (batch, head, row); the defaults are the packed [B, H, S, D] layouts.
+    const FlashAttentionLayout L = layout ? *layout : FlashAttentionLayout{
+        (size_t)H * Sq * D,   (size_t)Sq * D,  (size_t)D,
+        (size_t)H * Skv * D,  (size_t)Skv * D, (size_t)D,
+        (size_t)H * Skv * Dv, (size_t)Skv * Dv, (size_t)Dv };
     // Same block sizes as the MLAS kernel: Q rows per task and K/V rows per step.
     const int QB = std::min(Sq, 256), KB = std::min(Skv, 256);
     const int qBlocks = (Sq + QB - 1) / QB, tasks = B * H * qBlocks;
@@ -101,10 +142,12 @@ void flashAttention(const float* Q, const float* K, const float* V, float* out,
         for (int t = r.start; t < r.end; t++)
         {
             const int bh = t / qBlocks, q0 = t % qBlocks * QB, qn = std::min(QB, Sq - q0);
-            const float* k = K + (size_t)bh * Skv * D;
-            const float* v = V + (size_t)bh * Skv * Dv;
+            const int b = bh / H, h = bh % H;
+            const float* k = K + b * L.kB + h * L.kH;
+            const float* v = V + b * L.vB + h * L.vH;
+            const float* mbh = mask ? mask->data + b * mask->sB + h * mask->sH : nullptr;
             // Q block is the B operand of S^T = K_blk * Q_blk^T, packed once for all K/V steps.
-            hal::gemm32fPackB(Q + ((size_t)bh * Sq + q0) * D, D * fsz, qn, D,
+            hal::gemm32fPackB(Q + b * L.qB + h * L.qH + (size_t)q0 * L.qS, L.qS * fsz, qn, D,
                               CV_HAL_GEMM_2_T | CV_HAL_GEMM_SINGLE_THREAD, qbuf.data());
             for (int i = 0; i < qn; i++)
             {
@@ -119,8 +162,10 @@ void flashAttention(const float* Q, const float* K, const float* V, float* out,
                     hal::gemm32fPacked(k + j0, Skv * fsz, qbuf.data(), St, qn * fsz, kn, qn, D, scale, 0.f,
                                        CV_HAL_GEMM_1_T | CV_HAL_GEMM_SINGLE_THREAD);
                 else
-                    hal::gemm32fPacked(k + (size_t)j0 * D, D * fsz, qbuf.data(), St, qn * fsz, kn, qn, D, scale, 0.f,
+                    hal::gemm32fPacked(k + (size_t)j0 * L.kS, L.kS * fsz, qbuf.data(), St, qn * fsz, kn, qn, D, scale, 0.f,
                                        CV_HAL_GEMM_SINGLE_THREAD);
+                if (mbh)
+                    addMaskTile(St, mbh, *mask, q0, qn, j0, kn);
                 // Online softmax over each column of S^T: new max, exp, column sums.
                 std::copy(m, m + qn, mNew);
                 for (int j = 0; j < kn; j++)
@@ -137,11 +182,10 @@ void flashAttention(const float* Q, const float* K, const float* V, float* out,
                         scaleRow(O + (size_t)i * Dv, O + (size_t)i * Dv, Dv, corr);
                 }
                 // O += P * V_blk with P = (S^T)^T; the first block writes O.
-                hal::gemm32fBatch(1, St, &zero, qn * fsz, v + (size_t)j0 * Dv, &zero, Dv * fsz, O, &zero, Dv * fsz,
+                hal::gemm32fBatch(1, St, &zero, qn * fsz, v + (size_t)j0 * L.vS, &zero, L.vS * fsz, O, &zero, Dv * fsz,
                                   qn, Dv, kn, 1.f, j0 == 0 ? 0.f : 1.f, CV_HAL_GEMM_1_T | CV_HAL_GEMM_SINGLE_THREAD);
             }
             // out[b, q0 + i, h, :] = O[i] / l[i]
-            const int b = bh / H, h = bh % H;
             float* dst = out + (((size_t)b * Sq + q0) * H + h) * Dv;
             for (int i = 0; i < qn; i++)
                 scaleRow(O + (size_t)i * Dv, dst + (size_t)i * H * Dv, Dv, 1.f / l[i]);
