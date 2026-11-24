@@ -1071,6 +1071,28 @@ INSTANTIATE_TEST_CASE_P(/*nothing*/, Layer_Concat_Test,
     std::vector<int>({1})
 ));
 
+TEST(Layer_CumSum, EmptyAxis)
+{
+    // shape [2, 0, 3]: the scan axis (axis 1) has length 0
+    Mat input(MatShape{2, 0, 3}, CV_32F);
+
+    for (int reverse = 0; reverse <= 1; reverse++)
+    {
+        LayerParams lp;
+        lp.type = "CumSum";
+        lp.name = "cumsum";
+        lp.set("axis", 1);
+        lp.set("reverse", reverse);
+        Ptr<Layer> layer = CumSumLayer::create(lp);
+
+        std::vector<Mat> inputs{input}, outputs(1), internals;
+        outputs[0].create(MatShape{2, 0, 3}, CV_32F);
+        layer->forward(inputs, outputs, internals);
+
+        EXPECT_EQ(shape(outputs[0]), MatShape({2, 0, 3}));
+    }
+}
+
 typedef testing::TestWithParam<tuple<std::vector<int>, int>> Layer_Softmax_Test;
 TEST_P(Layer_Softmax_Test, Accuracy_01D) {
 
@@ -1761,5 +1783,44 @@ TEST(Layer_TopK2, ZeroK)
     }
 }
 
+TEST(Layer_Range, ZeroDelta)
+{
+    LayerParams lp;
+    lp.type = "Range";
+    lp.name = "range";
+    Ptr<Layer> layer = RangeLayer::create(lp);
+
+    for (int type : {CV_32F, CV_32S, CV_64S})
+    {
+        SCOPED_TRACE(typeToString(type));
+        Mat start(MatShape{1}, type, Scalar(0));
+        Mat limit(MatShape{1}, type, Scalar(5));
+        Mat delta(MatShape{1}, type, Scalar(0));
+        std::vector<Mat> inputs{start, limit, delta}, outputs(1), internals;
+        EXPECT_THROW(layer->forward(inputs, outputs, internals), cv::Exception);
+    }
+}
+
+TEST(Layer_CumProd, EmptyAxis)
+{
+    // shape [2, 0]: two rows with no elements, so the scan axis (axis 1) has length 0
+    Mat input(MatShape{2, 0}, CV_32F);
+
+    for (int reverse = 0; reverse <= 1; reverse++)
+    {
+        LayerParams lp;
+        lp.type = "CumProd";
+        lp.name = "cumprod";
+        lp.set("axis", 1);
+        lp.set("reverse", reverse);
+        Ptr<Layer> layer = CumProdLayer::create(lp);
+
+        std::vector<Mat> inputs{input}, outputs(1), internals;
+        outputs[0].create(MatShape{2, 0}, CV_32F);
+        layer->forward(inputs, outputs, internals);
+
+        EXPECT_EQ(shape(outputs[0]), MatShape({2, 0}));
+    }
+}
 
 }}

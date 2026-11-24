@@ -28,46 +28,8 @@
 "test_bernoulli_expanded",  // ---- same as above ---
 "test_bernoulli_seed",  // ---- same as above ---
 "test_bernoulli_seed_expanded",  // ---- same as above ---
-"test_castlike_FLOAT4E2M1_to_FLOAT",  // opencv_extra stores empty input data for these from-exotic CastLike cases
-"test_castlike_FLOAT4E2M1_to_FLOAT16",
-"test_castlike_FLOAT4E2M1_to_FLOAT16_expanded",
-"test_castlike_FLOAT4E2M1_to_FLOAT_expanded",
-"test_castlike_FLOAT8E4M3FNUZ_to_FLOAT",
-"test_castlike_FLOAT8E4M3FNUZ_to_FLOAT16",
-"test_castlike_FLOAT8E4M3FNUZ_to_FLOAT16_expanded",
-"test_castlike_FLOAT8E4M3FNUZ_to_FLOAT_expanded",
-"test_castlike_FLOAT8E4M3FN_to_FLOAT",
-"test_castlike_FLOAT8E4M3FN_to_FLOAT16",
-"test_castlike_FLOAT8E4M3FN_to_FLOAT16_expanded",
-"test_castlike_FLOAT8E4M3FN_to_FLOAT_expanded",
-"test_castlike_FLOAT8E5M2FNUZ_to_FLOAT",
-"test_castlike_FLOAT8E5M2FNUZ_to_FLOAT16",
-"test_castlike_FLOAT8E5M2FNUZ_to_FLOAT16_expanded",
-"test_castlike_FLOAT8E5M2FNUZ_to_FLOAT_expanded",
-"test_castlike_FLOAT8E5M2_to_FLOAT",
-"test_castlike_FLOAT8E5M2_to_FLOAT16",
-"test_castlike_FLOAT8E5M2_to_FLOAT16_expanded",
-"test_castlike_FLOAT8E5M2_to_FLOAT_expanded",
 "test_castlike_FLOAT_to_STRING",
-"test_castlike_INT4_to_FLOAT",
-"test_castlike_INT4_to_FLOAT16",
-"test_castlike_INT4_to_FLOAT16_expanded",
-"test_castlike_INT4_to_FLOAT_expanded",
-"test_castlike_INT4_to_INT8",
-"test_castlike_INT4_to_INT8_expanded",
 "test_castlike_STRING_to_FLOAT",  // Issues::Layer::Can't create layer "onnx_node_output_0!output" of type "CastLike" in function 'getLayerInstance'
-"test_castlike_UINT4_to_FLOAT",
-"test_castlike_UINT4_to_FLOAT16",
-"test_castlike_UINT4_to_FLOAT16_expanded",
-"test_castlike_UINT4_to_FLOAT_expanded",
-"test_castlike_UINT4_to_UINT8",
-"test_castlike_UINT4_to_UINT8_expanded",
-"test_clip_min_greater_than_max",
-"test_col2im",
-"test_col2im_5d",
-"test_col2im_dilations",
-"test_col2im_pads",
-"test_col2im_strides",
 "test_deform_conv_with_mask_bias",
 "test_deform_conv_with_multiple_offset_groups",
 "test_dequantizelinear_float4e2m1",
@@ -103,9 +65,6 @@
 "test_regex_full_match_basic",
 "test_regex_full_match_email_domain",
 "test_regex_full_match_empty",
-"test_reshape_allowzero_reordered",  // incompatible type of input tensor #0 'data': CV_8UC1 given, CV_32FC1 expected in function 'setGraphInput'
-"test_reversesequence_batch",  // Issue:: Parser: Can't create layer "onnx_node_output_0!y" of type "ReverseSequence" in function 'getLayerInstance'
-"test_reversesequence_time",  // ---- same as above ---
 // Scan edge cases beyond the opset-9+ dataflow the new engine supports:
 "test_scan_sum",  // opset-8 Scan (leading batch dim + sequence_lens, different semantics)
 "test_sequence_insert_at_back",  // Issue:: Parser:  typeProto.has_tensor_type() in function 'populateNet'
@@ -122,7 +81,6 @@
 "test_sequence_map_identity_1_sequence_expanded",
 "test_sequence_map_identity_2_sequences",
 "test_sequence_map_identity_2_sequences_expanded",
-"test_shape_start_greater_than_end",
 "test_split_to_sequence_1",
 "test_split_to_sequence_2",
 "test_split_to_sequence_nokeepdims",
@@ -197,8 +155,6 @@
 "test_quantizelinear_int2",
 "test_quantizelinear_uint2",
 // misc unsupported (expanded subgraphs / new ops)
-"test_castlike_no_saturate_FLOAT_to_FLOAT8E4M3FNUZ_expanded",
-"test_castlike_no_saturate_FLOAT_to_FLOAT8E4M3FN_expanded",
 "test_range_bfloat16_type_positive_delta_expanded",
 // ===== ONNX 1.22 additions: forward/accuracy not yet supported =====
 // Attention softcap accuracy
