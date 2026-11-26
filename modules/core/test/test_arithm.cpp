@@ -1946,9 +1946,8 @@ TEST_P(ArithmMixedTest, accuracy)
             mask = cvtest::randomMat(rng, size, CV_8UC1, 0, 2, true);
         }
 
-        dst0 = cvtest::randomMat(rng, size, dstType, minval, maxval, false);
         dst = cvtest::randomMat(rng, size, dstType, minval, maxval, true);
-        cvtest::copy(dst, dst0);
+        cvtest::copy(dst, dst0);   // creates a continuous dst0 holding dst's initial content
 
         op->generateScalars(dstDepth, rng);
 
@@ -3299,6 +3298,30 @@ TEST(Core_Norm, NORM_L2SQR_16SC4_large)
     EXPECT_EQ(expected, cv::norm(src, NORM_L2SQR));
 }
 
+TEST(Core_Norm, NORM_L2SQR_16S_min_value)
+{
+    // (-32768)^2 + (-32768)^2 does not fit into int32
+    for (int cn = 1; cn <= 4; cn++)
+    {
+        Mat src(4, 64, CV_16SC(cn), Scalar::all(SHRT_MIN));
+        const double expected = static_cast<double>(src.total()) * cn * 32768.0 * 32768.0;
+        EXPECT_EQ(expected, cv::norm(src, NORM_L2SQR)) << "cn=" << cn;
+        EXPECT_EQ(std::sqrt(expected), cv::norm(src, NORM_L2)) << "cn=" << cn;
+    }
+}
+
+TEST(Core_Norm, NORM_L2SQR_32S_min_value)
+{
+    // INT_MIN^2 + INT_MIN^2 does not fit into int64
+    for (int cn = 1; cn <= 4; cn++)
+    {
+        Mat src(4, 64, CV_32SC(cn), Scalar::all(INT_MIN));
+        const double expected = static_cast<double>(src.total()) * cn * 2147483648.0 * 2147483648.0;
+        EXPECT_EQ(expected, cv::norm(src, NORM_L2SQR)) << "cn=" << cn;
+        EXPECT_EQ(std::sqrt(expected), cv::norm(src, NORM_L2)) << "cn=" << cn;
+    }
+}
+
 // sum and mean on the fp8 depths, compared with the same values in CV_32F
 class Core_Sum_FP8 : public testing::TestWithParam< tuple<int, int, int> >
 {
@@ -3788,6 +3811,23 @@ TEST(Core_MeanStdDev, regression_multichannel)
         EXPECT_EQ(0, cv::norm(dst_m, ref_m, NORM_L1));
         EXPECT_EQ(0, cv::norm(dst_sd, ref_sd, NORM_L1));
     }
+}
+
+TEST(Core_MeanStdDev, bool_input)
+{
+    uchar src_buf[] = { 0, 1, 0, 255, 1, 0 };   // any non-zero byte means true
+    Mat src(1, 6, CV_Bool, src_buf);
+
+    EXPECT_EQ(0.5, cv::mean(src)[0]);
+
+    Scalar m, sd;
+    meanStdDev(src, m, sd);
+    EXPECT_EQ(0.5, m[0]);
+    EXPECT_EQ(0.5, sd[0]);
+
+    Mat mask(1, 6, CV_8U, Scalar(1));
+    EXPECT_THROW(cv::mean(src, mask), cv::Exception);
+    EXPECT_THROW(meanStdDev(src, m, sd, mask), cv::Exception);
 }
 
 // Related issue : https://github.com/opencv/opencv/issues/26861
